@@ -17,6 +17,15 @@ cuBLAS related utils
 #define CUBLAS_LOWP CUDA_R_32F
 #elif defined(ENABLE_FP16)
 #define CUBLAS_LOWP CUDA_R_16F
+// FP8 E4M3 (±448): recommended for weights and forward activations.
+// cuBLASLt FP8 GEMM requires sm_89+ (Ada Lovelace) or sm_90+ (Hopper).
+// The output (C/D) matrix is forced to BF16 by matmul.cuh when sizeof(floatX)==1.
+#elif defined(ENABLE_FP8_E4M3)
+#define CUBLAS_LOWP CUDA_R_8F_E4M3
+// FP8 E5M2 (±57344): recommended for gradients due to wider exponent range.
+// Same hardware and output-matrix constraints as E4M3 apply.
+#elif defined(ENABLE_FP8_E5M2)
+#define CUBLAS_LOWP CUDA_R_8F_E5M2
 #else // default to bfloat16
 #define CUBLAS_LOWP CUDA_R_16BF
 #endif

@@ -84,28 +84,32 @@ typedef Packed128<floatX> x128;
 
 // enumerator to indentify the datatype of a tensor.
 enum class DType : uint8_t {
-    FP32, FP16, BF16
+    FP32, FP16, BF16, FP8_E4M3, FP8_E5M2
 };
 
 // Given a datatype enum, returns the underlying number of bytes
 // for a scalar of that type
 size_t sizeof_dtype(DType type) {
     switch (type) {
-        case DType::FP32:
-            return sizeof(float);
-        case DType::FP16:
-            return sizeof(half);
-        case DType::BF16:
-            return sizeof(nv_bfloat16);
-        default: // handle or get compiler warning
+        case DType::FP32:     return sizeof(float);
+        case DType::FP16:     return sizeof(half);
+        case DType::BF16:     return sizeof(nv_bfloat16);
+        case DType::FP8_E4M3: return sizeof(__nv_fp8_e4m3);
+        case DType::FP8_E5M2: return sizeof(__nv_fp8_e5m2);
+        default:
             fprintf(stderr, "Unknown datatype\n");
             exit(EXIT_FAILURE);
     }
 }
 
-DType dtype_of(float* f) { return DType::FP32; }
-DType dtype_of(nv_bfloat16 * f) { return DType::BF16; }
-DType dtype_of(half * f) { return DType::FP16; }
+DType dtype_of(float* f)          { return DType::FP32; }
+DType dtype_of(nv_bfloat16 * f)   { return DType::BF16; }
+DType dtype_of(half * f)          { return DType::FP16; }
+#if defined(ENABLE_FP8_E4M3)
+DType dtype_of(__nv_fp8_e4m3 * f) { return DType::FP8_E4M3; }
+#elif defined(ENABLE_FP8_E5M2)
+DType dtype_of(__nv_fp8_e5m2 * f) { return DType::FP8_E5M2; }
+#endif
 
 
 
@@ -130,6 +134,19 @@ template<>
 __device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
     return __bfloat162float(val);
 }
+
+#if defined(ENABLE_FP8_E4M3) || defined(ENABLE_FP8_E5M2)
+// BF16 → FP8: go through float as the intermediate.
+// The hardware FP8 cast (via __nv_fp8_e4m3/__nv_fp8_e5m2 constructors) accepts float.
+template<>
+__device__ __nv_fp8_e4m3 cast_value<__nv_fp8_e4m3, __nv_bfloat16>(__nv_bfloat16 val) {
+    return (__nv_fp8_e4m3)__bfloat162float(val);
+}
+template<>
+__device__ __nv_fp8_e5m2 cast_value<__nv_fp8_e5m2, __nv_bfloat16>(__nv_bfloat16 val) {
+    return (__nv_fp8_e5m2)__bfloat162float(val);
+}
+#endif
 
 template<typename Td, typename Ts>
 __global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t stride_dst, ptrdiff_t stride_src) {
