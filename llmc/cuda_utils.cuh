@@ -94,8 +94,12 @@ size_t sizeof_dtype(DType type) {
         case DType::FP32:     return sizeof(float);
         case DType::FP16:     return sizeof(half);
         case DType::BF16:     return sizeof(nv_bfloat16);
+#if defined(ENABLE_FP8_E4M3)
         case DType::FP8_E4M3: return sizeof(__nv_fp8_e4m3);
+#endif
+#if defined(ENABLE_FP8_E5M2)
         case DType::FP8_E5M2: return sizeof(__nv_fp8_e5m2);
+#endif
         default:
             fprintf(stderr, "Unknown datatype\n");
             exit(EXIT_FAILURE);
