@@ -2,6 +2,7 @@
 Matrix Multiplication, with help from cuBLASLt
 */
 #include <assert.h>
+#include <stdint.h>
 #include <type_traits>      // std::bool_constant
 // llmc internal imports
 #include "cuda_common.h"
@@ -227,6 +228,83 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     cudaCheck(cudaGetLastError());
 }
 
+void matmul_cublaslt_fp8_weight(floatX* d, const uint8_t* a, const float* a_scale, const floatX* b, const floatX* bias,
+                                int m, int n, int k, cudaStream_t stream=0, bool transA=true, bool transB=false)
+{
+    NVTX_RANGE_FN();
+    bool has_bias = (bias != NULL);
+    if(((uintptr_t)a % 16) != 0 || ((uintptr_t)b % 16) != 0 || ((uintptr_t)d % 16) != 0 || (has_bias && ((uintptr_t)bias % 16) != 0)) {
+        printf("All cuBLASLt FP8 pointers must be aligned!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    cublasLtMatmulDesc_t operationDesc;
+    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+
+    int returnedResults = 0;
+    cublasLtMatmulPreference_t preference;
+    cublasLtMatmulHeuristicResult_t heuristic;
+
+    cublasOperation_t opNoTranspose = CUBLAS_OP_N;
+    cublasOperation_t opTranspose = CUBLAS_OP_T;
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, (transA)  ? &opTranspose : &opNoTranspose, sizeof(opTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, (transB) ? &opTranspose : &opNoTranspose, sizeof(opNoTranspose)));
+
+    cublasLtMatmulMatrixScale_t scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale, sizeof(a_scale)));
+
+    cublasLtMatrixLayout_t ALayout;
+    cublasLtMatrixLayout_t BLayout;
+    cublasLtMatrixLayout_t CLayout;
+    cublasLtMatrixLayout_t DLayout;
+    if (transA) {
+        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, CUDA_R_8F_E4M3, k, m, k));
+    } else {
+        cublasCheck(cublasLtMatrixLayoutCreate(&ALayout, CUDA_R_8F_E4M3, m, k, m));
+    }
+    if (transB) {
+        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, CUBLAS_LOWP, n, k, n));
+    } else {
+        cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, CUBLAS_LOWP, k, n, k));
+    }
+    cublasCheck(cublasLtMatrixLayoutCreate(&CLayout, CUBLAS_LOWP, m, n, m));
+    cublasCheck(cublasLtMatrixLayoutCreate(&DLayout, CUBLAS_LOWP, m, n, m));
+
+    cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                     &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
+
+    cublasLtEpilogue_t epilogue = has_bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT;
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+    if (has_bias) {
+        cublasDataType_t bias_data_type = CUBLAS_LOWP;
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_data_type, sizeof(bias_data_type)));
+        cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    }
+
+    cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
+                                   preference, 1, &heuristic, &returnedResults);
+    if (returnedResults == 0) {
+        printf("No cuBLASLt FP8 algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k, has_bias);
+        exit(EXIT_FAILURE);
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
+                               &alpha, a, ALayout, b, BLayout, &beta, d, CLayout, d, DLayout,
+                               &heuristic.algo, cublaslt_workspace, cublaslt_workspace_size, stream));
+
+    cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
+    cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
+    cublasCheck(cublasLtMatrixLayoutDestroy(ALayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(BLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(CLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(DLayout));
+    cudaCheck(cudaGetLastError());
+}
+
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical order of arguments)
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
@@ -239,6 +317,12 @@ void matmul_forward_cublaslt(floatX* out,
     } else {
         matmul_cublaslt(out, weight, inp, bias, OC, B*T, C, stream, true, false, 0, 0, 0, 0, false, pre_gelu, false);
     }
+}
+
+void matmul_forward_cublaslt_fp8(floatX* out,
+                     floatX* inp, uint8_t* weight, float* weight_scale, floatX* bias,
+                     int B, int T, int C, int OC, cudaStream_t stream) {
+    matmul_cublaslt_fp8_weight(out, weight, weight_scale, inp, bias, OC, B*T, C, stream, true, false);
 }
 
 void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,

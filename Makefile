@@ -244,7 +244,7 @@ else
 endif
 
 # PHONY means these targets will always be executed
-.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
+.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu convert_fp8_checkpoint
 
 # Add targets
 TARGETS = train_gpt2 test_gpt2
@@ -254,7 +254,7 @@ ifeq ($(NVCC),)
     $(info ✗ nvcc not found, skipping GPU/CUDA builds)
 else
     $(info ✓ nvcc found, including GPU/CUDA support)
-    TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu $(NVCC_CUDNN)
+    TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu convert_fp8_checkpoint $(NVCC_CUDNN)
 endif
 
 $(info ---------------------------------------------)
@@ -278,6 +278,9 @@ train_gpt2fp32cu: train_gpt2_fp32.cu
 
 test_gpt2cu: test_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+
+convert_fp8_checkpoint: convert_fp8_checkpoint.cu
+	$(NVCC) $(NVCC_FLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 test_gpt2fp32cu: test_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)

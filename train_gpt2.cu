@@ -5,10 +5,12 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <cuda_fp8.h>
 // ----------- CPU utilities -----------
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 // defines: create_dir_if_not_exists, find_max_step, ends_with_bin
@@ -93,6 +95,50 @@ typedef struct {
     int channels; // number of channels, e.g. 768
 } GPT2Config;
 
+enum CheckpointVersion {
+    MODEL_VERSION_FP32 = 3,
+    MODEL_VERSION_BF16 = 5,
+    MODEL_VERSION_FP8_E4M3 = 6,
+};
+
+constexpr const float FP8_E4M3_MAX = 448.0f;
+
+bool tensor_is_fp8_quantized(int tensor_idx) {
+    return tensor_idx == 4 || tensor_idx == 6 || tensor_idx == 10 || tensor_idx == 12;
+}
+
+int fp8_tensor_slot(int tensor_idx) {
+    switch (tensor_idx) {
+        case 4:  return 0;
+        case 6:  return 1;
+        case 10: return 2;
+        case 12: return 3;
+        default: return -1;
+    }
+}
+
+int tensor_scale_count(int tensor_idx, const GPT2Config& config) {
+    return tensor_is_fp8_quantized(tensor_idx) ? config.num_layers : 0;
+}
+
+bool fp8_native_supported() {
+    return deviceProp.major > 8 || (deviceProp.major == 8 && deviceProp.minor >= 9);
+}
+
+typedef struct {
+    uint8_t* qkvw;      // (L, 3*C, C)
+    uint8_t* attprojw;  // (L, C, C)
+    uint8_t* fcw;       // (L, 4*C, C)
+    uint8_t* fcprojw;   // (L, C, 4*C)
+} FP8ParameterTensors;
+
+typedef struct {
+    float* qkvw;      // (L)
+    float* attprojw;  // (L)
+    float* fcw;       // (L)
+    float* fcprojw;   // (L)
+} FP8ScaleTensors;
+
 // the parameters of the model
 constexpr const int NUM_PARAMETER_TENSORS = 16;
 typedef struct {
@@ -165,6 +211,31 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
         params_memory_iterator += param_elements[i] * param_sizeof[i];
     }
     return params_memory;
+}
+
+void set_parameter_tensor_pointers(ParameterTensors* params, void** ptrs) {
+    floatX** tensor_ptrs[] = {
+        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
+        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
+        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+    };
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        *(tensor_ptrs[i]) = (floatX*)ptrs[i];
+    }
+}
+
+void set_fp8_tensor_pointers(FP8ParameterTensors* params, void** ptrs) {
+    uint8_t** tensor_ptrs[] = {&params->qkvw, &params->attprojw, &params->fcw, &params->fcprojw};
+    for (int i = 0; i < 4; i++) {
+        *(tensor_ptrs[i]) = (uint8_t*)ptrs[i];
+    }
+}
+
+void set_fp8_scale_pointers(FP8ScaleTensors* scales, void** ptrs) {
+    float** tensor_ptrs[] = {&scales->qkvw, &scales->attprojw, &scales->fcw, &scales->fcprojw};
+    for (int i = 0; i < 4; i++) {
+        *(tensor_ptrs[i]) = (float*)ptrs[i];
+    }
 }
 
 constexpr int NUM_ACTIVATION_TENSORS = 21;
@@ -286,11 +357,21 @@ typedef struct {
     GPT2Config config;
     // the weights of the model, and their sizes
     ParameterTensors params;
+    FP8ParameterTensors fp8_params;
+    FP8ScaleTensors fp8_scales;
     size_t param_elements[NUM_PARAMETER_TENSORS];
     size_t param_sizeof[NUM_PARAMETER_TENSORS];
     void* params_memory;
+    void* param_tensor_allocations[NUM_PARAMETER_TENSORS];
+    void* fp8_param_allocations[4];
+    void* fp8_scale_allocations[4];
     size_t num_parameters;
     size_t num_parameters_bytes;
+    int checkpoint_version;
+    int has_fp8_weights;
+    int disable_fp8;
+    int fp8_fallback_bf16;
+    int use_fp8_matmul;
     // gradients of the weights
     ParameterTensors grads;
     void* grads_memory;
@@ -322,6 +403,12 @@ typedef struct {
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
+    memset(&model->params, 0, sizeof(model->params));
+    memset(&model->fp8_params, 0, sizeof(model->fp8_params));
+    memset(&model->fp8_scales, 0, sizeof(model->fp8_scales));
+    memset(model->param_tensor_allocations, 0, sizeof(model->param_tensor_allocations));
+    memset(model->fp8_param_allocations, 0, sizeof(model->fp8_param_allocations));
+    memset(model->fp8_scale_allocations, 0, sizeof(model->fp8_scale_allocations));
     // common inits outside of the model weights
     // memory lazily initialized in forward()
     model->acts_memory = NULL;
@@ -334,6 +421,11 @@ void gpt2_init_common(GPT2 *model) {
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
     model->params_memory = NULL;
+    model->checkpoint_version = 0;
+    model->has_fp8_weights = 0;
+    model->disable_fp8 = 0;
+    model->fp8_fallback_bf16 = 0;
+    model->use_fp8_matmul = 0;
     // memory lazily initialized in backward()
     model->grads_memory = NULL;
     model->workload_indices = NULL; // on cpu, for encoder_backward
@@ -364,11 +456,39 @@ void gpt2_allocate_weights(GPT2 *model) {
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 }
 
-void gpt2_allocate_state(GPT2 *model, int B, int T) {
-    printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
-    assert(model->grads_memory == nullptr);
-    model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
+void gpt2_allocate_weights_fp8(GPT2 *model) {
+    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
+    model->num_parameters = 0;
+    model->num_parameters_bytes = 0;
+    void* param_ptrs[NUM_PARAMETER_TENSORS] = {};
+    void* fp8_ptrs[4] = {};
+    void* scale_ptrs[4] = {};
 
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        model->num_parameters += model->param_elements[i];
+        if (!tensor_is_fp8_quantized(i)) {
+            size_t bytes = model->param_elements[i] * model->param_sizeof[i];
+            cudaCheck(cudaMalloc(&param_ptrs[i], bytes));
+            model->param_tensor_allocations[i] = param_ptrs[i];
+            model->num_parameters_bytes += bytes;
+        } else {
+            int slot = fp8_tensor_slot(i);
+            size_t qbytes = model->param_elements[i] * sizeof(uint8_t);
+            size_t sbytes = tensor_scale_count(i, model->config) * sizeof(float);
+            cudaCheck(cudaMalloc(&fp8_ptrs[slot], qbytes));
+            cudaCheck(cudaMalloc(&scale_ptrs[slot], sbytes));
+            model->fp8_param_allocations[slot] = fp8_ptrs[slot];
+            model->fp8_scale_allocations[slot] = scale_ptrs[slot];
+            model->num_parameters_bytes += qbytes + sbytes;
+        }
+    }
+
+    set_parameter_tensor_pointers(&model->params, param_ptrs);
+    set_fp8_tensor_pointers(&model->fp8_params, fp8_ptrs);
+    set_fp8_scale_pointers(&model->fp8_scales, scale_ptrs);
+}
+
+void gpt2_allocate_state(GPT2 *model, int B, int T, bool allocate_training_state=true) {
     // record the current B,T as well
     model->batch_size = B;
     model->seq_len = T;
@@ -381,6 +501,14 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
     cudaCheck(cudaMalloc(((void**)&model->accumulated_mean_loss), sizeof(float)));
     cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
+
+    if (!allocate_training_state) {
+        return;
+    }
+
+    printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
+    assert(model->grads_memory == nullptr);
+    model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
 
     // initialise cpu scratch buffers for encoder backward
     size_t num_c_groups = CEIL_DIV(model->config.channels, (WARP_SIZE * x128::size));
@@ -427,7 +555,80 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     printf0(" -> estimated maximum batch size: %zu\n", B + free / bytes_per_sequence);
 }
 
+template <typename T>
+T* malloc_host_buffer(size_t count) {
+    return (T*)mallocCheck(count * sizeof(T));
+}
+
+float fp8_e4m3_to_float(uint8_t raw) {
+    __nv_fp8_e4m3 value;
+    memcpy(&value, &raw, sizeof(raw));
+    return (float)value;
+}
+
+uint8_t float_to_fp8_e4m3(float value) {
+    __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(value);
+    uint8_t raw;
+    memcpy(&raw, &fp8, sizeof(raw));
+    return raw;
+}
+
+float fp8_quant_scale(const float* values, size_t count) {
+    float amax = 0.0f;
+    for (size_t i = 0; i < count; i++) {
+        amax = fmaxf(amax, fabsf(values[i]));
+    }
+    return amax == 0.0f ? 1.0f : amax / FP8_E4M3_MAX;
+}
+
+void read_bf16_tensor_to_device(floatX* dst, FILE* file, size_t count) {
+    __nv_bfloat16* host_in = malloc_host_buffer<__nv_bfloat16>(count);
+    floatX* host_out = malloc_host_buffer<floatX>(count);
+    freadCheck(host_in, sizeof(__nv_bfloat16), count, file);
+    for (size_t i = 0; i < count; i++) {
+        host_out[i] = (floatX)((float)host_in[i]);
+    }
+    cudaCheck(cudaMemcpy(dst, host_out, count * sizeof(floatX), cudaMemcpyHostToDevice));
+    free(host_in);
+    free(host_out);
+}
+
+void read_fp8_tensor_to_device(uint8_t* dst, float* scale_dst, FILE* file, size_t count, int scale_count) {
+    float* host_scales = malloc_host_buffer<float>(scale_count);
+    uint8_t* host_weights = malloc_host_buffer<uint8_t>(count);
+    freadCheck(host_scales, sizeof(float), scale_count, file);
+    freadCheck(host_weights, sizeof(uint8_t), count, file);
+    cudaCheck(cudaMemcpy(scale_dst, host_scales, scale_count * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(dst, host_weights, count * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    free(host_scales);
+    free(host_weights);
+}
+
+void read_fp8_tensor_dequantized_to_device(floatX* dst, FILE* file, size_t count, int num_layers) {
+    float* host_scales = malloc_host_buffer<float>(num_layers);
+    uint8_t* host_weights = malloc_host_buffer<uint8_t>(count);
+    floatX* host_out = malloc_host_buffer<floatX>(count);
+    freadCheck(host_scales, sizeof(float), num_layers, file);
+    freadCheck(host_weights, sizeof(uint8_t), count, file);
+    size_t layer_size = count / num_layers;
+    for (int l = 0; l < num_layers; l++) {
+        float scale = host_scales[l];
+        size_t layer_offset = l * layer_size;
+        for (size_t i = 0; i < layer_size; i++) {
+            host_out[layer_offset + i] = (floatX)(fp8_e4m3_to_float(host_weights[layer_offset + i]) * scale);
+        }
+    }
+    cudaCheck(cudaMemcpy(dst, host_out, count * sizeof(floatX), cudaMemcpyHostToDevice));
+    free(host_scales);
+    free(host_weights);
+    free(host_out);
+}
+
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
+    if (model->has_fp8_weights) {
+        fprintf(stderr, "Writing FP8 checkpoints from train_gpt2.cu is not supported; use the offline converter.\n");
+        exit(EXIT_FAILURE);
+    }
     // write the model to a checkpoint file
     printf0("Writing model to %s\n", checkpoint_path);
     FILE *model_file = fopenCheck(checkpoint_path, "wb");
@@ -436,7 +637,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     memset(model_header, 0, sizeof(model_header));
     model_header[0] = 20240326; // magic number
     assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
-    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5; // version
+    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? MODEL_VERSION_FP32 : MODEL_VERSION_BF16;
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
     model_header[4] = model->config.num_layers;
@@ -471,22 +672,23 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
     int version = model_header[1];
-    if (!(version == 3 || version == 5)) {
-        // 3 = fp32, padded vocab
-        // 5 = bf16, padded vocab, layernorms also in bf16
+    if (!(version == MODEL_VERSION_FP32 || version == MODEL_VERSION_BF16 || version == MODEL_VERSION_FP8_E4M3)) {
         fprintf(stderr, "Bad version in model file\n");
         fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
     }
+    model->checkpoint_version = version;
+    model->has_fp8_weights = version == MODEL_VERSION_FP8_E4M3;
+    model->use_fp8_matmul = 0;
 
     // check if the precision mode of the checkpoing matches the model precision
-    if (weight_init) {
-        if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
+    if (weight_init && version != MODEL_VERSION_FP8_E4M3) {
+        if (PRECISION_MODE == PRECISION_BF16 && version != MODEL_VERSION_BF16) {
             fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
             fprintf(stderr, "---> HINT: are you sure you're loading a _bf16.bin file?\n");
             exit(EXIT_FAILURE);
         }
-        if (PRECISION_MODE == PRECISION_FP32 && version != 3) {
+        if (PRECISION_MODE == PRECISION_FP32 && version != MODEL_VERSION_FP32) {
             fprintf(stderr, "Precision is configured as FP32 but model at %s is not.\n", checkpoint_path);
             fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2cu PRECISION=FP32`\n");
             fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
@@ -502,13 +704,48 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
 
-    // allocate memory for the model parameters
-    gpt2_allocate_weights(model);
+    if (version == MODEL_VERSION_FP8_E4M3) {
+        bool native_fp8 = !model->disable_fp8 && fp8_native_supported() && PRECISION_MODE == PRECISION_BF16;
+        if (!native_fp8 && !model->fp8_fallback_bf16 && !model->disable_fp8) {
+            fprintf(stderr, "Native FP8 inference is unavailable. Re-run with --fp8-fallback-bf16 or --disable-fp8.\n");
+            exit(EXIT_FAILURE);
+        }
+        model->use_fp8_matmul = native_fp8;
+        if (native_fp8) {
+            gpt2_allocate_weights_fp8(model);
+        } else {
+            gpt2_allocate_weights(model);
+        }
+    } else {
+        gpt2_allocate_weights(model);
+    }
 
     // read in the parameters if weight_init is true
     if (weight_init) {
-        assert(model->params_memory != NULL);
-        file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
+        if (version == MODEL_VERSION_FP8_E4M3) {
+            floatX** tensor_ptrs[] = {
+                &model->params.wte, &model->params.wpe, &model->params.ln1w, &model->params.ln1b, &model->params.qkvw, &model->params.qkvb,
+                &model->params.attprojw, &model->params.attprojb, &model->params.ln2w, &model->params.ln2b, &model->params.fcw, &model->params.fcb,
+                &model->params.fcprojw, &model->params.fcprojb, &model->params.lnfw, &model->params.lnfb
+            };
+            uint8_t* fp8_ptrs[] = {model->fp8_params.qkvw, model->fp8_params.attprojw, model->fp8_params.fcw, model->fp8_params.fcprojw};
+            float* scale_ptrs[] = {model->fp8_scales.qkvw, model->fp8_scales.attprojw, model->fp8_scales.fcw, model->fp8_scales.fcprojw};
+            for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+                if (tensor_is_fp8_quantized(i)) {
+                    int slot = fp8_tensor_slot(i);
+                    if (model->use_fp8_matmul) {
+                        read_fp8_tensor_to_device(fp8_ptrs[slot], scale_ptrs[slot], model_file, model->param_elements[i], tensor_scale_count(i, model->config));
+                    } else {
+                        read_fp8_tensor_dequantized_to_device(*(tensor_ptrs[i]), model_file, model->param_elements[i], model->config.num_layers);
+                    }
+                } else {
+                    read_bf16_tensor_to_device(*(tensor_ptrs[i]), model_file, model->param_elements[i]);
+                }
+            }
+        } else {
+            assert(model->params_memory != NULL);
+            file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
+        }
     }
     fcloseCheck(model_file);
 
@@ -649,7 +886,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
 
     // ensure the model was initialized or error out
-    if (model->params_memory == NULL) {
+    if (model->params_memory == NULL && !model->has_fp8_weights) {
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
     }
@@ -676,6 +913,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
     // forward pass
     ParameterTensors params = model->params; // for brevity
+    FP8ParameterTensors fp8_params = model->fp8_params;
+    FP8ScaleTensors fp8_scales = model->fp8_scales;
     ActivationTensors acts = model->acts;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
 
@@ -688,15 +927,15 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
+        floatX* l_qkvw = params.qkvw ? params.qkvw + l * 3*C * C : NULL;
         floatX* l_qkvb = params.qkvb + l * 3*C;
-        floatX* l_attprojw = params.attprojw + l * C * C;
+        floatX* l_attprojw = params.attprojw ? params.attprojw + l * C * C : NULL;
         floatX* l_attprojb = params.attprojb + l * C;
         floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
+        floatX* l_fcw = params.fcw ? params.fcw + l * 4*C * C : NULL;
         floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
+        floatX* l_fcprojw = params.fcprojw ? params.fcprojw + l * C * 4*C : NULL;
         floatX* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
@@ -713,11 +952,19 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
+        uint8_t* l_qkvw_fp8 = fp8_params.qkvw ? fp8_params.qkvw + l * 3*C * C : NULL;
+        uint8_t* l_attprojw_fp8 = fp8_params.attprojw ? fp8_params.attprojw + l * C * C : NULL;
+        uint8_t* l_fcw_fp8 = fp8_params.fcw ? fp8_params.fcw + l * 4*C * C : NULL;
+        uint8_t* l_fcprojw_fp8 = fp8_params.fcprojw ? fp8_params.fcprojw + l * C * 4*C : NULL;
 
         // now do the forward pass
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        if (model->use_fp8_matmul) {
+            matmul_forward_cublaslt_fp8(l_qkvr, l_ln1, l_qkvw_fp8, fp8_scales.qkvw + l, l_qkvb, B, T, C, 3*C, main_stream);
+        } else {
+            matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        }
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
@@ -726,14 +973,28 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        if (model->use_fp8_matmul) {
+            matmul_forward_cublaslt_fp8(scratch, l_ln1, l_qkvw_fp8, fp8_scales.qkvw + l, l_qkvb, B, T, C, 3*C, main_stream);
+        } else {
+            matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        }
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
-        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        if (model->use_fp8_matmul) {
+            matmul_forward_cublaslt_fp8(scratch, l_atty, l_attprojw_fp8, fp8_scales.attprojw + l, l_attprojb, B, T, C, C, main_stream);
+        } else {
+            matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        }
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        if (model->use_fp8_matmul) {
+            matmul_forward_cublaslt_fp8(l_fch, l_ln2, l_fcw_fp8, fp8_scales.fcw + l, l_fcb, B, T, C, 4*C, main_stream);
+            gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
+            matmul_forward_cublaslt_fp8(scratch, l_fch_gelu, l_fcprojw_fp8, fp8_scales.fcprojw + l, l_fcprojb, B, T, 4*C, C, main_stream);
+        } else {
+            matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+            matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        }
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -786,6 +1047,10 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
 }
 
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
+    if (model->has_fp8_weights) {
+        fprintf(stderr, "Backward is disabled for FP8 checkpoints.\n");
+        exit(EXIT_FAILURE);
+    }
     if(model->grads_memory == nullptr) {
         fprintf(stderr, "Need to allocate gradients before backward");
         exit(EXIT_FAILURE);
@@ -1034,6 +1299,10 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t,
                  MultiGpuConfig* multi_gpu_config, bool init_from_master_only=false) {
+    if (model->has_fp8_weights) {
+        fprintf(stderr, "Optimizer update is disabled for FP8 checkpoints.\n");
+        exit(EXIT_FAILURE);
+    }
     // update the model parameters using the AdamW optimizer
     // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
     // so we may not be responsible for the entire parameter tensor
@@ -1154,6 +1423,13 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 
 void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->params_memory);
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        cudaFreeCheck(&model->param_tensor_allocations[i]);
+    }
+    for (int i = 0; i < 4; i++) {
+        cudaFreeCheck(&model->fp8_param_allocations[i]);
+        cudaFreeCheck(&model->fp8_scale_allocations[i]);
+    }
     cudaFreeCheck(&model->grads_memory);
     cudaFreeCheck(&model->m_memory);
     cudaFreeCheck(&model->v_memory);
@@ -1401,6 +1677,8 @@ void error_usage() {
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
+    fprintf(stderr, "  --disable-fp8       dequantize FP8 checkpoints to the baseline path at load time\n");
+    fprintf(stderr, "  --fp8-fallback-bf16 allow BF16 fallback when native FP8 inference is unavailable\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
@@ -1449,6 +1727,8 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    int disable_fp8 = 0;
+    int fp8_fallback_bf16 = 0;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1456,7 +1736,9 @@ int main(int argc, char *argv[]) {
     char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
     char server_ip[256] = "";  // used if init_method set to "tcp" -> set to your server ip address
     char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
-    for (int i = 1; i < argc; i+=2) {
+    for (int i = 1; i < argc; ) {
+        if (strcmp(argv[i], "--disable-fp8") == 0) { disable_fp8 = 1; i += 1; continue; }
+        if (strcmp(argv[i], "--fp8-fallback-bf16") == 0) { fp8_fallback_bf16 = 1; i += 1; continue; }
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
@@ -1499,6 +1781,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
         else { error_usage(); }
+        i += 2;
     }
 
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
@@ -1571,6 +1854,8 @@ int main(int argc, char *argv[]) {
     // build the GPT-2 model
     GPT2 model;
     gpt2_init_common(&model);
+    model.disable_fp8 = disable_fp8;
+    model.fp8_fallback_bf16 = fp8_fallback_bf16;
     if (resuming == 1) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         // if we are using master weights, we'll init them later inside load_state()
@@ -1588,7 +1873,13 @@ int main(int argc, char *argv[]) {
     model.use_master_weights = use_master_weights;
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
+    if (model.use_fp8_matmul && model.gelu_fusion > 0) {
+        printf0("FP8 path disables cuBLASLt GELU fusion; forcing -ge 0 semantics.\n");
+        model.gelu_fusion = 0;
+    }
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
+    printf0("| fp8 checkpoint        | %-50s |\n", model.has_fp8_weights ? "yes" : "no");
+    printf0("| fp8 runtime path      | %-50s |\n", model.use_fp8_matmul ? "native fp8 gemm" : (model.has_fp8_weights ? "bf16 fallback" : "disabled"));
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf0("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
@@ -1610,6 +1901,10 @@ int main(int argc, char *argv[]) {
         size_t ntok = train_loader.num_tokens;
         // the number of (outer loop) steps each process should take for us to reach one epoch
         train_num_batches = ntok / total_batch_size;
+    }
+    if (model.has_fp8_weights && train_num_batches > 0) {
+        fprintf(stderr, "FP8 checkpoints are inference-only in this build. Set -x 0 to run validation/generation without training.\n");
+        exit(EXIT_FAILURE);
     }
     // figure out the number of validation steps to run for
     int val_num_batches = val_max_steps; // passed in from command line
@@ -1674,7 +1969,8 @@ int main(int argc, char *argv[]) {
 
     // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
-    gpt2_allocate_state(&model, B, T);
+    bool allocate_training_state = train_num_batches > 0 && !model.has_fp8_weights;
+    gpt2_allocate_state(&model, B, T, allocate_training_state);
     if (resuming == 1) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
         load_state(&step, &model, &train_loader, filename_buffer);

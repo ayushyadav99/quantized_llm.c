@@ -166,7 +166,7 @@ int main(int argc, char *argv[]) {
     // overall OK signal for the test
     int allok = 1;
 
-    gpt2_allocate_state(&model, B, T);
+    gpt2_allocate_state(&model, B, T, true);
 
     // First, do target-free forward pass to validate logits
     gpt2_forward(&model, x, B, T);
@@ -343,7 +343,7 @@ int main(int argc, char *argv[]) {
     gpt2_free(&model);
     gpt2_build_from_checkpoint(&model, "test_gpt2cu_model.ckpt");
     int ld_step;
-    gpt2_allocate_state(&model, B, T);
+    gpt2_allocate_state(&model, B, T, true);
     load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
