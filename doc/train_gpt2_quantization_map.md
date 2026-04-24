@@ -7,10 +7,11 @@ Where is the code already doing low-precision work, and where would quantization
 Current status:
 
 - `train_gpt2.cu` now has an optional row-wise PTQ shadow behind `--ptq`
-- all learnable parameter tensors are quantized to `int8` or `fp8`
-- forward and backward read a dequantized mirror of that shadow
+- PTQ is weight-only: `wte`, `wpe`, `qkvw`, `attprojw`, `fcw`, and `fcprojw`
+- the runtime `params_memory` view is dequantized in-place from that shadow
 - optimizer state and optional master weights remain in FP32
 - the PTQ shadow is regenerated after optimizer updates and after restore-from-master flows
+- startup prints include compressed weight bytes, compression ratio, and size saving
 
 ## 1. What "mixed precision" means in this codebase
 
@@ -94,7 +95,7 @@ Why these matter most:
 
 - They dominate FLOPs
 - They already go through a narrow abstraction (`matmul_forward_cublaslt`)
-- Even though the current PTQ path quantizes all learnable tensors, these are still the dominant accuracy/performance seams
+- These are exactly the tensors quantized by the current PTQ path
 
 ## 4. Backward pass: what gets harder
 
@@ -107,14 +108,14 @@ Backward depends on:
 - gradients in `floatX`
 - `matmul_backward(...)`
 
-The current PTQ implementation avoids custom quantized backward kernels by making both forward and backward read the same dequantized runtime mirror through `gpt2_get_active_params()`.
+The current PTQ implementation avoids custom quantized backward kernels by dequantizing the PTQ shadow back into the runtime `params_memory` tensors before forward/backward use them.
 
 That keeps the training path simple:
 
 1. update canonical trainable weights in the usual path
 2. rebuild the quantized shadow
-3. dequantize that shadow into the runtime mirror
-4. use that mirror consistently in forward and backward
+3. dequantize that shadow back into the runtime `floatX` weights in-place
+4. use those constrained runtime weights in forward and backward
 
 ## 5. Optimizer/update path: what already resembles quantization workflow
 
@@ -161,13 +162,15 @@ Instead:
 The implemented PTQ entry points are:
 
 1. [`train_gpt2.cu`](/Users/kvlnraju/College/courses/semester-4/efficient-ai/project/quantized_llm.c/train_gpt2.cu)
-   `gpt2_prepare_ptq()` quantizes every parameter tensor and rebuilds the dequantized runtime mirror.
+   `gpt2_prepare_ptq()` quantizes the large weight tensors and dequantizes them back into `params_memory` in-place.
 2. [`train_gpt2.cu`](/Users/kvlnraju/College/courses/semester-4/efficient-ai/project/quantized_llm.c/train_gpt2.cu)
-   `gpt2_get_active_params()` selects the dequantized PTQ mirror for forward/backward when PTQ is enabled.
+   `gpt2_forward()` and `gpt2_backward_and_reduce()` directly read `model->params`, which already hold the dequantized-from-PTQ runtime weights.
 3. [`train_gpt2.cu`](/Users/kvlnraju/College/courses/semester-4/efficient-ai/project/quantized_llm.c/train_gpt2.cu)
    `gpt2_update()` regenerates the PTQ shadow after parameter updates.
 4. [`train_gpt2.cu`](/Users/kvlnraju/College/courses/semester-4/efficient-ai/project/quantized_llm.c/train_gpt2.cu)
    `load_state()` reuses the normal parameter restore flow, and PTQ is rebuilt from canonical weights rather than checkpointed separately.
+5. [`train_gpt2.cu`](/Users/kvlnraju/College/courses/semester-4/efficient-ai/project/quantized_llm.c/train_gpt2.cu)
+   `gpt2_print_ptq_summary()` reports compressed bytes and the percentage size saving for the quantized weight subset.
 
 ## 8. Recommended implementation order
 
@@ -175,7 +178,7 @@ If you want to extend this further without turning it into a research detour, th
 
 1. Keep the current row-wise shadow path as the single source of PTQ behavior
 2. Optimize shadow rebuild/dequantization cost if it becomes a bottleneck
-3. Decide whether biases and norm parameters should remain quantized or be exempted
+3. If accuracy allows it, consider whether more tensors should join the weight-only PTQ set
 4. Only after that, consider quantized activations or direct quantized GEMMs
 
 That keeps the design aligned with what this code already does well: low-precision storage with higher-precision update math.

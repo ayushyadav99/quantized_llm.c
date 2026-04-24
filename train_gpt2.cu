@@ -263,8 +263,9 @@ static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*),
 
 typedef struct {
     QuantizedTensor tensors[NUM_PARAMETER_TENSORS];
-    ParameterTensors dequantized_params;
-    void* dequantized_params_memory;
+    size_t original_weight_bytes;
+    size_t quantized_weight_bytes;
+    int num_quantized_tensors;
     bool initialized;
 } QuantizedParameters;
 
@@ -291,6 +292,33 @@ void get_parameter_tensor_ptrs(ParameterTensors* params, floatX** ptrs[NUM_PARAM
     ptrs[13] = &params->fcprojb;
     ptrs[14] = &params->lnfw;
     ptrs[15] = &params->lnfb;
+}
+
+const char* parameter_tensor_name(int tensor_id) {
+    static const char* names[NUM_PARAMETER_TENSORS] = {
+        "wte", "wpe", "ln1w", "ln1b", "qkvw", "qkvb", "attprojw", "attprojb",
+        "ln2w", "ln2b", "fcw", "fcb", "fcprojw", "fcprojb", "lnfw", "lnfb"
+    };
+    if (tensor_id < 0 || tensor_id >= NUM_PARAMETER_TENSORS) {
+        return "unknown";
+    }
+    return names[tensor_id];
+}
+
+bool ptq_should_quantize_tensor(int tensor_id) {
+    // Keep this strictly weight-only: large 2D weights and embeddings only.
+    // Biases and LayerNorm weights are tiny and not worth the added error/noise.
+    switch (tensor_id) {
+        case 0:  // wte
+        case 1:  // wpe
+        case 4:  // qkvw
+        case 6:  // attprojw
+        case 10: // fcw
+        case 12: // fcprojw
+            return true;
+        default:
+            return false;
+    }
 }
 
 PTQTensorLayout ptq_tensor_layout_for_index(GPT2Config config, int tensor_id) {
@@ -524,7 +552,7 @@ typedef struct {
     bool init_state;   // set to true if master weights need to be initialized
     int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
-    // optional row-wise PTQ shadow for all learnable tensors
+    // optional row-wise PTQ shadow for the large weight tensors only
     int ptq_enabled;
     PTQPrecision ptq_precision;
     QuantizedParameters ptq;
@@ -539,20 +567,10 @@ void gpt2_clear_ptq(GPT2 *model) {
         cudaFreeCheck(&model->ptq.tensors[i].scales);
         model->ptq.tensors[i] = {};
     }
-    cudaFreeCheck(&model->ptq.dequantized_params_memory);
-    model->ptq.dequantized_params = {};
+    model->ptq.original_weight_bytes = 0;
+    model->ptq.quantized_weight_bytes = 0;
+    model->ptq.num_quantized_tensors = 0;
     model->ptq.initialized = false;
-}
-
-ParameterTensors gpt2_get_active_params(const GPT2 *model) {
-    if (!model->ptq_enabled || model->ptq_precision == PTQ_PRECISION_NONE) {
-        return model->params;
-    }
-    if (!model->ptq.initialized) {
-        fprintf(stderr, "PTQ is enabled but quantized parameters are not prepared.\n");
-        exit(EXIT_FAILURE);
-    }
-    return model->ptq.dequantized_params;
 }
 
 void gpt2_init_common(GPT2 *model) {
@@ -603,16 +621,19 @@ void gpt2_prepare_ptq(GPT2 *model) {
         exit(EXIT_FAILURE);
     }
 
-    gpt2_clear_ptq(model);
-    model->ptq.dequantized_params_memory = malloc_and_point_parameters(
-        &model->ptq.dequantized_params, model->param_elements, model->param_sizeof);
-
     floatX** src_ptrs[NUM_PARAMETER_TENSORS];
-    floatX** dst_ptrs[NUM_PARAMETER_TENSORS];
     get_parameter_tensor_ptrs(&model->params, src_ptrs);
-    get_parameter_tensor_ptrs(&model->ptq.dequantized_params, dst_ptrs);
+
+    if (!model->ptq.initialized) {
+        model->ptq.original_weight_bytes = 0;
+        model->ptq.quantized_weight_bytes = 0;
+        model->ptq.num_quantized_tensors = 0;
+    }
 
     for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+        if (!ptq_should_quantize_tensor(i)) {
+            continue;
+        }
         PTQTensorLayout layout = ptq_tensor_layout_for_index(model->config, i);
         const size_t total_rows = (size_t)layout.num_layers * layout.rows_per_layer;
         const size_t total_elements = total_rows * layout.cols;
@@ -630,18 +651,28 @@ void gpt2_prepare_ptq(GPT2 *model) {
         ptq_quantize_rows_host(qvalues_host, scales_host, tensor_host, (int)total_rows, layout.cols, model->ptq_precision);
 
         QuantizedTensor* qtensor = &model->ptq.tensors[i];
-        cudaCheck(cudaMalloc((void**)&qtensor->qvalues, total_elements * sizeof(uint8_t)));
-        cudaCheck(cudaMalloc((void**)&qtensor->scales, total_rows * sizeof(float)));
+        if (!qtensor->initialized) {
+            cudaCheck(cudaMalloc((void**)&qtensor->qvalues, total_elements * sizeof(uint8_t)));
+            cudaCheck(cudaMalloc((void**)&qtensor->scales, total_rows * sizeof(float)));
+            qtensor->num_layers = layout.num_layers;
+            qtensor->rows_per_layer = layout.rows_per_layer;
+            qtensor->cols = layout.cols;
+            qtensor->initialized = true;
+
+            model->ptq.original_weight_bytes += total_elements * sizeof(floatX);
+            model->ptq.quantized_weight_bytes += total_elements * sizeof(uint8_t) + total_rows * sizeof(float);
+            model->ptq.num_quantized_tensors += 1;
+        } else {
+            assert(qtensor->num_layers == layout.num_layers);
+            assert(qtensor->rows_per_layer == layout.rows_per_layer);
+            assert(qtensor->cols == layout.cols);
+        }
         cudaCheck(cudaMemcpy(qtensor->qvalues, qvalues_host, total_elements * sizeof(uint8_t), cudaMemcpyHostToDevice));
         cudaCheck(cudaMemcpy(qtensor->scales, scales_host, total_rows * sizeof(float), cudaMemcpyHostToDevice));
 
-        ptq_dequantize_rows(*dst_ptrs[i], qtensor->qvalues, qtensor->scales,
+        // Keep params_memory as the runtime weight view, but constrain it to the quantized lattice.
+        ptq_dequantize_rows(*src_ptrs[i], qtensor->qvalues, qtensor->scales,
                             (int)total_rows, layout.cols, model->ptq_precision, main_stream);
-
-        qtensor->num_layers = layout.num_layers;
-        qtensor->rows_per_layer = layout.rows_per_layer;
-        qtensor->cols = layout.cols;
-        qtensor->initialized = true;
 
         free(tensor_host_raw);
         free(tensor_host);
@@ -651,6 +682,38 @@ void gpt2_prepare_ptq(GPT2 *model) {
 
     cudaCheck(cudaStreamSynchronize(main_stream));
     model->ptq.initialized = true;
+}
+
+void gpt2_print_ptq_summary(const GPT2 *model) {
+    if (!model->ptq_enabled || model->ptq_precision == PTQ_PRECISION_NONE || !model->ptq.initialized) {
+        return;
+    }
+    char tensor_list[128];
+    tensor_list[0] = '\0';
+    bool first = true;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+        if (!ptq_should_quantize_tensor(i)) {
+            continue;
+        }
+        if (!first) {
+            strncat(tensor_list, ",", sizeof(tensor_list) - strlen(tensor_list) - 1);
+        }
+        strncat(tensor_list, parameter_tensor_name(i), sizeof(tensor_list) - strlen(tensor_list) - 1);
+        first = false;
+    }
+    const size_t original_bytes = model->ptq.original_weight_bytes;
+    const size_t quantized_bytes = model->ptq.quantized_weight_bytes;
+    const double compression_ratio = quantized_bytes > 0 ? (double)original_bytes / (double)quantized_bytes : 0.0;
+    const double savings_pct = original_bytes > 0 ? 100.0 * (1.0 - (double)quantized_bytes / (double)original_bytes) : 0.0;
+
+    printf0("| ptq tensors list      | %-50s |\n", tensor_list);
+    printf0("| ptq tensors           | %-50d |\n", model->ptq.num_quantized_tensors);
+    printf0("| ptq original bytes    | %-50zu |\n", original_bytes);
+    printf0("| ptq quantized bytes   | %-50zu |\n", quantized_bytes);
+    printf0("| ptq compression       | %-50.2fx |\n", compression_ratio);
+    printf0("| ptq size saving       | %-49.2f%% |\n", savings_pct);
+    printf0("| ptq runtime overhead  | %-50zu |\n", quantized_bytes);
+    printf0("+-----------------------+----------------------------------------------------+\n");
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -986,7 +1049,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     //    (see cublas_compute in common_start and llmc/matmul.cuh)
     // 3) numerically sensitive reductions/statistics (layernorm mean/rstd, losses) stay float
     // There is no AMP/autocast framework here; precision is selected at compile time.
-    ParameterTensors params = gpt2_get_active_params(model); // for brevity
+    ParameterTensors params = model->params; // PTQ constrains params in-place when enabled
     ActivationTensors acts = model->acts;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
 
@@ -1125,7 +1188,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
 
-    ParameterTensors params = gpt2_get_active_params(model); // for brevity
+    ParameterTensors params = model->params; // PTQ constrains params in-place when enabled
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
 
@@ -1735,7 +1798,7 @@ void error_usage() {
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
-    fprintf(stderr, "  --ptq <0|1>           enable row-wise PTQ for all learnable tensors (default = 0)\n");
+    fprintf(stderr, "  --ptq <0|1>           enable row-wise PTQ for large weight tensors (default = 0)\n");
     fprintf(stderr, "  --ptq_precision <str> PTQ precision for quantized weights: int8|fp8 (default = int8)\n");
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
@@ -1929,7 +1992,9 @@ int main(int argc, char *argv[]) {
     model.recompute = recompute;
     model.ptq_enabled = ptq_enabled;
     model.ptq_precision = ptq_enabled ? ptq_precision_from_string(ptq_precision_name) : PTQ_PRECISION_NONE;
-    gpt2_prepare_ptq(&model);
+    if (!(resuming == 1 && use_master_weights == 1)) {
+        gpt2_prepare_ptq(&model);
+    }
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
@@ -1939,6 +2004,7 @@ int main(int argc, char *argv[]) {
     printf0("| channels C            | %-50d |\n", model.config.channels);
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf0("+-----------------------+----------------------------------------------------+\n");
+    gpt2_print_ptq_summary(&model);
 
     // build DataLoaders for both train and val
     int permute_train_loader = (overfit_single_batch == 1) ? 0 : 1;
@@ -2019,6 +2085,9 @@ int main(int argc, char *argv[]) {
     if (resuming == 1) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
         load_state(&step, &model, &train_loader, filename_buffer);
+        if (model.ptq_enabled && model.use_master_weights) {
+            gpt2_print_ptq_summary(&model);
+        }
     }
 
     // init an OutlierDetector the training loss
