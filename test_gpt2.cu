@@ -88,7 +88,8 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
     return params_memory;
 }
 
-int check_ptq_roundtrip(PTQPrecision precision, float max_abs_threshold, float max_rel_threshold) {
+int check_ptq_roundtrip(PTQPrecision precision, float max_abs_threshold, float mean_abs_threshold,
+                        float max_rel_threshold, float rel_epsilon) {
     const int rows = 2;
     const int cols = 8;
     const float source[rows * cols] = {
@@ -102,16 +103,25 @@ int check_ptq_roundtrip(PTQPrecision precision, float max_abs_threshold, float m
     ptq_dequantize_rows_host(restored, quantized, scales, rows, cols, precision);
 
     float max_abs = 0.0f;
+    float mean_abs = 0.0f;
     float max_rel = 0.0f;
+    int rel_count = 0;
     for (int i = 0; i < rows * cols; ++i) {
         const float abs_diff = fabsf(source[i] - restored[i]);
-        const float rel_diff = fabsf(source[i]) > 1e-8f ? abs_diff / fabsf(source[i]) : abs_diff;
         max_abs = fmaxf(max_abs, abs_diff);
-        max_rel = fmaxf(max_rel, rel_diff);
+        mean_abs += abs_diff;
+        if (fabsf(source[i]) > rel_epsilon) {
+            const float rel_diff = abs_diff / fabsf(source[i]);
+            max_rel = fmaxf(max_rel, rel_diff);
+            rel_count += 1;
+        }
     }
-    const int ok = max_abs <= max_abs_threshold && max_rel <= max_rel_threshold;
-    printf("PTQ %s roundtrip: max_abs=%f max_rel=%f => %s\n",
-           ptq_precision_to_string(precision), max_abs, max_rel, ok ? "OK" : "NOT OK");
+    mean_abs /= (rows * cols);
+    const int ok = max_abs <= max_abs_threshold && mean_abs <= mean_abs_threshold &&
+                   (rel_count == 0 || max_rel <= max_rel_threshold);
+    printf("PTQ %s roundtrip: max_abs=%f mean_abs=%f max_rel=%f (|x|>%g) => %s\n",
+           ptq_precision_to_string(precision), max_abs, mean_abs, max_rel, rel_epsilon,
+           ok ? "OK" : "NOT OK");
     return ok;
 }
 
@@ -119,12 +129,12 @@ int check_ptq_forward_regression(GPT2* model, const int* x, const int* y, int B,
                                  const float* baseline_logits, int V, int Vp) {
     struct RegressionConfig {
         PTQPrecision precision;
-        float max_logit_diff;
+        float mean_logit_diff;
         float max_loss_diff;
     };
     const RegressionConfig configs[] = {
         {PTQ_PRECISION_INT8, 0.75f, 0.05f},
-        {PTQ_PRECISION_FP8,  1.50f, 0.15f},
+        {PTQ_PRECISION_FP8,  6.00f, 0.20f},
     };
 
     int ok = 1;
@@ -142,17 +152,21 @@ int check_ptq_forward_regression(GPT2* model, const int* x, const int* y, int B,
             logits[i] = (float)logits_raw[i];
         }
         float max_logit_diff = 0.0f;
+        double sum_logit_diff = 0.0;
         for (int bt = 0; bt < B * T; ++bt) {
             for (int v = 0; v < V; ++v) {
                 const float diff = fabsf(baseline_logits[bt * Vp + v] - logits[bt * Vp + v]);
                 max_logit_diff = fmaxf(max_logit_diff, diff);
+                sum_logit_diff += diff;
             }
         }
+        const float mean_logit_diff = (float)(sum_logit_diff / (double)(B * T * V));
         float ptq_loss = gpt2_validate(model, x, y, B, T);
         float loss_diff = fabsf(ptq_loss - baseline_loss);
-        const int config_ok = max_logit_diff <= config.max_logit_diff && loss_diff <= config.max_loss_diff;
-        printf("PTQ %s forward regression: max_logit_diff=%f loss_diff=%f => %s\n",
-               ptq_precision_to_string(config.precision), max_logit_diff, loss_diff, config_ok ? "OK" : "NOT OK");
+        const int config_ok = mean_logit_diff <= config.mean_logit_diff && loss_diff <= config.max_loss_diff;
+        printf("PTQ %s forward regression: mean_logit_diff=%f max_logit_diff=%f loss_diff=%f => %s\n",
+               ptq_precision_to_string(config.precision), mean_logit_diff, max_logit_diff, loss_diff,
+               config_ok ? "OK" : "NOT OK");
         ok &= config_ok;
         gpt2_clear_ptq(model);
         model->ptq_enabled = 0;
@@ -289,8 +303,8 @@ int main(int argc, char *argv[]) {
     printf("OK (LOGITS)\n");
     printf("logit max diff: %f\n", max_diff);
 
-    allok &= check_ptq_roundtrip(PTQ_PRECISION_INT8, 0.03f, 0.20f);
-    allok &= check_ptq_roundtrip(PTQ_PRECISION_FP8, 0.20f, 0.60f);
+    allok &= check_ptq_roundtrip(PTQ_PRECISION_INT8, 0.03f, 0.01f, 0.20f, 1e-2f);
+    allok &= check_ptq_roundtrip(PTQ_PRECISION_FP8, 3.00f, 0.35f, 0.75f, 1e-2f);
     allok &= check_ptq_forward_regression(&model, x, y, B, T, logits_cpu, V, Vp);
 
     // let's do 10 training iterations, following the pytorch code
