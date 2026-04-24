@@ -124,7 +124,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
         float indicator = (i == ix) ? 1.0f : 0.0f;
         float dlogit = (prob - indicator) * dloss;
         if (WriteDLogits){
-            __stcs(logits + idx * P + i, (floatX)dlogit);
+            store_streaming(logits + idx * P + i, (floatX)dlogit);
         }
         if (WriteProbs) {
             probs[idx * P + i] = (floatX)prob;

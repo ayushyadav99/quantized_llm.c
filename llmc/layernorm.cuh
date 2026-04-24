@@ -59,8 +59,8 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __res
         // load and store using the .cs "streaming" hint to the compiler,
         // indicating that this data will not be reused soon, and can be streamed through the caches
         // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
-        float n = s * ((float)__ldcs(x+c) - m);
-        __stcs(o+c, (floatX)(n * (float)weight[c] + (float)bias[c]));
+        float n = s * ((float)load_streaming(x + c) - m);
+        store_streaming(o + c, (floatX)(n * (float)weight[c] + (float)bias[c]));
     }
 }
 
