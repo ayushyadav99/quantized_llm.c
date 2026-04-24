@@ -243,6 +243,23 @@ else
   PFLAGS = -DENABLE_BF16
 endif
 
+# Load precision settings: controls floatLOAD / LOAD_PRECISION_MODE.
+# Defaults to matching PRECISION (no flag needed). Override e.g. with LOAD_PRECISION=FP32
+# to load weights in FP32 while computing in BF16, enabling a quantization step.
+ifdef LOAD_PRECISION
+  VALID_LOAD_PRECISIONS := FP32 FP16 BF16
+  ifeq ($(filter $(LOAD_PRECISION),$(VALID_LOAD_PRECISIONS)),)
+    $(error Invalid LOAD_PRECISION $(LOAD_PRECISION), valid values are $(VALID_LOAD_PRECISIONS))
+  endif
+  ifeq ($(LOAD_PRECISION), FP32)
+    PFLAGS += -DENABLE_LOAD_FP32
+  else ifeq ($(LOAD_PRECISION), FP16)
+    PFLAGS += -DENABLE_LOAD_FP16
+  else ifeq ($(LOAD_PRECISION), BF16)
+    PFLAGS += -DENABLE_LOAD_BF16
+  endif
+endif
+
 # PHONY means these targets will always be executed
 .PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu train_gpt2_weights_quantization
 

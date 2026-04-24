@@ -91,6 +91,25 @@ typedef __nv_bfloat16 floatX;
 #define PRECISION_MODE PRECISION_BF16
 #endif
 
+// floatLOAD is the precision used when loading weights from a checkpoint file.
+// Only defined when LOAD_PRECISION=FP32/FP16/BF16 is explicitly passed at build time,
+// which emits -DENABLE_LOAD_FP32 / -DENABLE_LOAD_FP16 / -DENABLE_LOAD_BF16 respectively.
+// When none of these flags are set, floatLOAD defaults to BF16 and LOAD_PRECISION_MODE is left undefined
+// so code can use #ifdef LOAD_PRECISION_MODE to detect whether a separate load precision
+// was requested.
+#if defined(ENABLE_LOAD_FP32)
+typedef float floatLOAD;
+#define LOAD_PRECISION_MODE PRECISION_FP32
+#elif defined(ENABLE_LOAD_FP16)
+typedef half floatLOAD;
+#define LOAD_PRECISION_MODE PRECISION_FP16
+#elif defined(ENABLE_LOAD_BF16)
+typedef __nv_bfloat16 floatLOAD;
+#define LOAD_PRECISION_MODE PRECISION_BF16
+#else
+typedef __nv_bfloat16 floatLOAD;
+#endif
+
 // ----------------------------------------------------------------------------
 // Load and store with streaming cache hints
 // Older nvcc does not provide __ldcs and __stcs for bfloat16, despite these
