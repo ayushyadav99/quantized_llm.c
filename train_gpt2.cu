@@ -887,10 +887,59 @@ void gpt2_prepare_ptq(GPT2 *model) {
                              max_layer_elems * sizeof(floatX)));
         model->scratch_dequant_elems = max_layer_elems;
     }
-    printf0("[beast-ptq] quantized %d tensors; freed %.1f MiB, kept %.1f MiB floatX params\n",
-            model->ptq.num_quantized_tensors,
-            (double)model->ptq.original_weight_bytes / (1024.0*1024.0),
-            (double)compact_bytes / (1024.0*1024.0));
+    // ------------------------------------------------------------------ //
+    // Detailed per-tensor weight memory report
+    // ------------------------------------------------------------------ //
+    // Total original weight bytes (all tensors, floatX)
+    size_t total_original_bytes = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i)
+        total_original_bytes += model->param_elements[i] * sizeof(floatX);
+
+    // Total new weight bytes = compact floatX + qvalues(uint8) + scales(float) + scratch
+    size_t scratch_bytes = max_layer_elems * sizeof(floatX);
+    size_t total_new_bytes = compact_bytes                         // unquantized floatX
+                           + model->ptq.quantized_weight_bytes     // qvalues + scales
+                           + scratch_bytes;                        // scratch_dequant
+
+    printf0("\n");
+    printf0("[beast-ptq] Weight memory breakdown\n");
+    printf0("+-----------------+----------+-----------+-----------+-----------+\n");
+    printf0("| Tensor          | Elements |  Orig MiB |   New MiB |  Saved MB |\n");
+    printf0("+-----------------+----------+-----------+-----------+-----------+\n");
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+        size_t elems  = model->param_elements[i];
+        double orig   = (double)(elems * sizeof(floatX)) / (1024.0 * 1024.0);
+        double newmib, saved;
+        if (ptq_should_quantize_tensor(i)) {
+            PTQTensorLayout lo = ptq_tensor_layout_for_index(model->config, i);
+            size_t total_rows  = (size_t)lo.num_layers * lo.rows_per_layer;
+            double qval_mib    = (double)(elems * sizeof(uint8_t))    / (1024.0 * 1024.0);
+            double scale_mib   = (double)(total_rows * sizeof(float)) / (1024.0 * 1024.0);
+            newmib = qval_mib + scale_mib;
+            saved  = orig - newmib;
+        } else {
+            newmib = orig;   // kept as-is
+            saved  = 0.0;
+        }
+        const char* marker = ptq_should_quantize_tensor(i) ? " *" : "  ";
+        printf0("| %-13s%s | %8zu | %9.2f | %9.2f | %9.2f |\n",
+                parameter_tensor_name(i), marker, elems, orig, newmib, saved);
+    }
+    printf0("+-----------------+----------+-----------+-----------+-----------+\n");
+    printf0("  * = quantized (int8 qvalues + float scales stored in beast ptq)\n");
+    printf0("\n");
+    printf0("  scratch_dequant  (reused per layer, NOT persistent)  : %6.2f MiB\n",
+            (double)scratch_bytes / (1024.0 * 1024.0));
+    printf0("\n");
+    printf0("  Original weight memory (floatX, all %d tensors)      : %6.1f MiB\n",
+            NUM_PARAMETER_TENSORS, (double)total_original_bytes / (1024.0 * 1024.0));
+    printf0("  New weight memory      (compact floatX + qvalues)    : %6.1f MiB\n",
+            (double)(compact_bytes + model->ptq.quantized_weight_bytes) / (1024.0 * 1024.0));
+    printf0("  ----------------------------------------------------------\n");
+    printf0("  Net weight memory saved                               : %6.1f MiB (%.1f%%)\n",
+            (double)(total_original_bytes - compact_bytes - model->ptq.quantized_weight_bytes) / (1024.0 * 1024.0),
+            100.0 * (1.0 - (double)(compact_bytes + model->ptq.quantized_weight_bytes) / (double)total_original_bytes));
+    printf0("\n");
 }
 
 void gpt2_print_ptq_summary(const GPT2 *model) {
