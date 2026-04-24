@@ -1797,6 +1797,16 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // - stochastic-round the new value back into floatX for next forward pass
     //   (for beast mode: the floatX output is thrown away; we requantize from master_weights instead)
     bool beast = model->ptq_enabled && model->ptq.initialized;
+    // Build a pointer array into model->params.* once, before the loop.
+    // After gpt2_prepare_ptq, params_memory is the compact block and the
+    // params.* pointers have been updated in-place to reflect the compact layout.
+    // Using these directly avoids recomputing offsets that are wrong for compact memory.
+    floatX* param_ptrs[NUM_PARAMETER_TENSORS];
+    {
+        floatX** pp[NUM_PARAMETER_TENSORS];
+        get_parameter_tensor_ptrs(&model->params, pp);
+        for (int k = 0; k < NUM_PARAMETER_TENSORS; ++k) param_ptrs[k] = *(pp[k]);
+    }
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         unsigned int seed = random_u32(&model->rng_state);
 
@@ -1819,9 +1829,11 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
         if (!beast || !ptq_should_quantize_tensor(i)) {
             // ----------------------------------------------------------------
-            // Non-quantized path (same as before): param_ptr is in params_memory.
+            // Non-quantized path: param_ptr comes from model->params.* which
+            // is always correct for both full (non-beast) and compact (beast)
+            // params_memory layouts. Do NOT recompute from params_memory+offset.
             // ----------------------------------------------------------------
-            floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
+            floatX* param_ptr = param_ptrs[i] + shard.offset; // shard.offset==0 for single GPU
             if (init_state && model->master_weights != nullptr) {
                 size_t grid_size = CEIL_DIV(shard.size, 512);
                 copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(
