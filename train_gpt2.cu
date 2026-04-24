@@ -62,6 +62,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/adamw.cuh"
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
+// defines: quantize_weights, dequantize_weights
+#include "llmc/quantize.cuh"
 // ----------- Multi-GPU support -----------
 // defines: ncclFloatX, ncclCheck, MultiGpuConfig, ShardInfo
 // defines: printf0, multi_gpu_config
@@ -114,6 +116,27 @@ typedef struct {
     floatX* lnfb; // (C)
 } ParameterTensors;
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
+
+// INT8 quantized copies of the weight matrices used in matmuls.
+// Biases and layernorm weights are small and not used in matmuls — skip those.
+// wte is kept in full precision: dequantizing Vp*C (~73 MiB for GPT-2 base) every
+// forward pass just for one classifier matmul costs more than it saves.
+constexpr const int NUM_QUANTIZED_TENSORS = 4;
+typedef struct {
+    int8_t* qkvw;     // (L, 3*C, C)
+    int8_t* attprojw; // (L, C, C)
+    int8_t* fcw;      // (L, 4*C, C)
+    int8_t* fcprojw;  // (L, C, 4*C)
+} QuantizedParameterTensors;
+
+// Per-row float32 scales for each quantized tensor.
+// scale[row] = max(|w[row, :]|) / 127, stored contiguously per tensor.
+typedef struct {
+    float* qkvw;     // L*3C scales
+    float* attprojw; // L*C scales
+    float* fcw;      // L*4C scales
+    float* fcprojw;  // L*C scales
+} ParameterScales;
 
 void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
     size_t Vp = config.padded_vocab_size;
@@ -298,6 +321,13 @@ typedef struct {
     float* m_memory;
     float* v_memory;
     float* master_weights;     // is NULL unless fp32 weights is enabled.
+    // W8A16 INT8 quantization (lazily initialized by gpt2_quantize_weights)
+    QuantizedParameterTensors qparams;
+    ParameterScales qscales;
+    void* qparams_memory;       // single contiguous int8_t buffer for all quantized weights
+    void* qscales_memory;       // single contiguous float buffer for all scale arrays
+    floatX* dequant_buffer;     // (4*C*C) scratch — dequantized layer weight, reused each matmul
+    bool use_quantization;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];
@@ -342,6 +372,10 @@ void gpt2_init_common(GPT2 *model) {
     model->m_memory = NULL;
     model->v_memory = NULL;
     model->master_weights = NULL;
+    model->qparams_memory = NULL;
+    model->qscales_memory = NULL;
+    model->dequant_buffer = NULL;
+    model->use_quantization = false;
     // other default settings
     model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
@@ -362,6 +396,88 @@ void gpt2_allocate_weights(GPT2 *model) {
     // create memory for model parameters on the device
     assert(model->params_memory == nullptr);
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+}
+
+void gpt2_quantize_weights(GPT2 *model, cudaStream_t stream) {
+    assert(model->params_memory != NULL); // weights must be loaded before quantizing
+    assert(model->qparams_memory == NULL); // guard against double-call
+
+    const size_t Vp = model->config.padded_vocab_size;
+    const size_t C  = model->config.channels;
+    const size_t L  = model->config.num_layers;
+
+    // number of int8 elements per quantized tensor
+    const size_t qelem[NUM_QUANTIZED_TENSORS] = {
+        L * 3*C * C,  // qkvw
+        L * C * C,    // attprojw
+        L * 4*C * C,  // fcw
+        L * C * 4*C,  // fcprojw
+    };
+    // number of float32 scales per tensor (one per output row)
+    const size_t selem[NUM_QUANTIZED_TENSORS] = {
+        L * 3*C,  // qkvw:     L*3C rows
+        L * C,    // attprojw: L*C rows
+        L * 4*C,  // fcw:      L*4C rows
+        L * C,    // fcprojw:  L*C rows
+    };
+
+    size_t total_qbytes = 0, total_sbytes = 0;
+    for (int i = 0; i < NUM_QUANTIZED_TENSORS; i++) {
+        total_qbytes += qelem[i] * sizeof(int8_t);
+        total_sbytes += selem[i] * sizeof(float);
+    }
+    printf0("quantizing weights to INT8: %zu MiB (weights) + %zu KiB (scales)\n",
+            total_qbytes / (1024*1024), total_sbytes / 1024);
+
+    cudaCheck(cudaMalloc(&model->qparams_memory, total_qbytes));
+    cudaCheck(cudaMalloc(&model->qscales_memory, total_sbytes));
+
+    // point each struct field into the two contiguous buffers
+    int8_t** qptrs[NUM_QUANTIZED_TENSORS] = {
+        &model->qparams.qkvw, &model->qparams.attprojw,
+        &model->qparams.fcw,  &model->qparams.fcprojw
+    };
+    float** sptrs[NUM_QUANTIZED_TENSORS] = {
+        &model->qscales.qkvw, &model->qscales.attprojw,
+        &model->qscales.fcw,  &model->qscales.fcprojw
+    };
+    int8_t* qit = (int8_t*)model->qparams_memory;
+    float*  sit = (float* )model->qscales_memory;
+    for (int i = 0; i < NUM_QUANTIZED_TENSORS; i++) {
+        *qptrs[i] = qit;  qit += qelem[i];
+        *sptrs[i] = sit;  sit += selem[i];
+    }
+
+    // source floatX pointers and their (rows, cols) layout for the quantize kernels
+    const floatX* src[NUM_QUANTIZED_TENSORS] = {
+        model->params.qkvw, model->params.attprojw,
+        model->params.fcw,  model->params.fcprojw,
+    };
+    const int rows[NUM_QUANTIZED_TENSORS] = {
+        (int)(L * 3*C),  // qkvw
+        (int)(L * C),    // attprojw
+        (int)(L * 4*C),  // fcw
+        (int)(L * C),    // fcprojw
+    };
+    const int cols[NUM_QUANTIZED_TENSORS] = {
+        (int)C,      // qkvw
+        (int)C,      // attprojw
+        (int)C,      // fcw
+        (int)(4*C),  // fcprojw
+    };
+
+    // dequant_buffer: reused each forward pass — sized for the largest per-layer weight (fcw: 4*C*C)
+    assert(model->dequant_buffer == NULL);
+    cudaCheck(cudaMalloc((void**)&model->dequant_buffer, 4*C*C * sizeof(floatX)));
+    printf0("allocating %zu KiB for dequantization scratch buffer\n", 4*C*C * sizeof(floatX) / 1024);
+
+    for (int i = 0; i < NUM_QUANTIZED_TENSORS; i++) {
+        quantize_weights(*qptrs[i], *sptrs[i], src[i], rows[i], cols[i], stream);
+    }
+    cudaCheck(cudaStreamSynchronize(stream));
+
+    model->use_quantization = true;
+    printf0("quantization complete\n");
 }
 
 void gpt2_allocate_state(GPT2 *model, int B, int T) {
@@ -514,6 +630,163 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
 
     // only return from this function once we are certain the params are ready on the GPU
     cudaCheck(cudaDeviceSynchronize());
+}
+
+// Which of the 16 ParameterTensors indices are stored as INT8 in a quantized checkpoint.
+// Order matches ParameterTensors: wte(0) wpe(1) ln1w(2) ln1b(3) qkvw(4) qkvb(5)
+//   attprojw(6) attprojb(7) ln2w(8) ln2b(9) fcw(10) fcb(11) fcprojw(12) fcprojb(13) lnfw(14) lnfb(15)
+static const bool PARAM_IS_QUANTIZED[NUM_PARAMETER_TENSORS] = {
+    false, false, false, false,   // wte, wpe, ln1w, ln1b
+    true,  false, true,  false,   // qkvw, qkvb, attprojw, attprojb
+    false, false, true,  false,   // ln2w, ln2b, fcw, fcb
+    true,  false, false, false    // fcprojw, fcprojb, lnfw, lnfb
+};
+
+void gpt2_write_quantized_checkpoint(GPT2 *model, const char* path) {
+    assert(model->use_quantization);
+    printf0("Writing quantized checkpoint to %s\n", path);
+    FILE* f = fopenCheck(path, "wb");
+
+    int model_header[256];
+    memset(model_header, 0, sizeof(model_header));
+    model_header[0] = 20240326; // magic
+    model_header[1] = 7;        // version 7 = INT8 W8A16 quantized
+    model_header[2] = model->config.max_seq_len;
+    model_header[3] = model->config.vocab_size;
+    model_header[4] = model->config.num_layers;
+    model_header[5] = model->config.num_heads;
+    model_header[6] = model->config.channels;
+    model_header[7] = model->config.padded_vocab_size;
+    fwriteCheck(model_header, sizeof(int), 256, f);
+
+    // floatX pointers for the 16 tensors, same order as ParameterTensors struct
+    const void* float_ptrs[NUM_PARAMETER_TENSORS] = {
+        model->params.wte,      model->params.wpe,      model->params.ln1w,     model->params.ln1b,
+        model->params.qkvw,     model->params.qkvb,     model->params.attprojw, model->params.attprojb,
+        model->params.ln2w,     model->params.ln2b,     model->params.fcw,      model->params.fcb,
+        model->params.fcprojw,  model->params.fcprojb,  model->params.lnfw,     model->params.lnfb
+    };
+    // int8_t pointers for the 4 quantized tensors (NULL for non-quantized slots)
+    const void* int8_ptrs[NUM_PARAMETER_TENSORS] = {
+        nullptr, nullptr,              nullptr, nullptr,
+        model->qparams.qkvw,  nullptr, model->qparams.attprojw, nullptr,
+        nullptr, nullptr,              model->qparams.fcw,       nullptr,
+        model->qparams.fcprojw, nullptr, nullptr, nullptr
+    };
+
+    // write 16 tensors: floatX for non-quantized, int8_t for quantized
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        if (PARAM_IS_QUANTIZED[i]) {
+            device_to_file(f, (void*)int8_ptrs[i],
+                           model->param_elements[i] * sizeof(int8_t), IO_BUF_SIZE, main_stream);
+        } else {
+            device_to_file(f, (void*)float_ptrs[i],
+                           model->param_elements[i] * model->param_sizeof[i], IO_BUF_SIZE, main_stream);
+        }
+    }
+
+    // write the 4 scale arrays (float32) in quantized-tensor order: qkvw, attprojw, fcw, fcprojw
+    const size_t C = model->config.channels;
+    const size_t L = model->config.num_layers;
+    const size_t scale_counts[NUM_QUANTIZED_TENSORS] = { L*3*C, L*C, L*4*C, L*C };
+    const void*  scale_ptrs [NUM_QUANTIZED_TENSORS]  = {
+        model->qscales.qkvw, model->qscales.attprojw, model->qscales.fcw, model->qscales.fcprojw
+    };
+    for (int i = 0; i < NUM_QUANTIZED_TENSORS; i++) {
+        device_to_file(f, (void*)scale_ptrs[i],
+                       scale_counts[i] * sizeof(float), IO_BUF_SIZE, main_stream);
+    }
+
+    fcloseCheck(f);
+    printf0("Quantized checkpoint written\n");
+}
+
+void gpt2_build_from_quantized_checkpoint(GPT2 *model, const char* path) {
+    FILE* f = fopenCheck(path, "rb");
+    int model_header[256];
+    freadCheck(model_header, sizeof(int), 256, f);
+    if (model_header[0] != 20240326) { fprintf(stderr, "Bad magic in quantized checkpoint\n"); exit(EXIT_FAILURE); }
+    if (model_header[1] != 7) { fprintf(stderr, "Expected version 7 (INT8 quantized), got %d\n", model_header[1]); exit(EXIT_FAILURE); }
+
+    model->config.max_seq_len       = model_header[2];
+    model->config.vocab_size        = model_header[3];
+    model->config.num_layers        = model_header[4];
+    model->config.num_heads         = model_header[5];
+    model->config.channels          = model_header[6];
+    model->config.padded_vocab_size = model_header[7];
+
+    // allocate floatX params_memory (quantized slots will be allocated but left uninitialised —
+    // use_quantization=true means they are never read during forward)
+    gpt2_allocate_weights(model);
+
+    const size_t C = model->config.channels;
+    const size_t L = model->config.num_layers;
+
+    // allocate INT8 weight buffer and scale buffer
+    const size_t qelem[NUM_QUANTIZED_TENSORS] = { L*3*C*C, L*C*C, L*4*C*C, L*C*4*C };
+    const size_t selem[NUM_QUANTIZED_TENSORS] = { L*3*C,   L*C,   L*4*C,   L*C     };
+    size_t total_qbytes = 0, total_sbytes = 0;
+    for (int i = 0; i < NUM_QUANTIZED_TENSORS; i++) {
+        total_qbytes += qelem[i] * sizeof(int8_t);
+        total_sbytes += selem[i] * sizeof(float);
+    }
+    cudaCheck(cudaMalloc(&model->qparams_memory, total_qbytes));
+    cudaCheck(cudaMalloc(&model->qscales_memory, total_sbytes));
+
+    // point struct fields into the contiguous buffers
+    int8_t** qptrs[NUM_QUANTIZED_TENSORS] = {
+        &model->qparams.qkvw, &model->qparams.attprojw,
+        &model->qparams.fcw,  &model->qparams.fcprojw
+    };
+    float** sptrs[NUM_QUANTIZED_TENSORS] = {
+        &model->qscales.qkvw, &model->qscales.attprojw,
+        &model->qscales.fcw,  &model->qscales.fcprojw
+    };
+    int8_t* qit = (int8_t*)model->qparams_memory;
+    float*  sit = (float* )model->qscales_memory;
+    for (int i = 0; i < NUM_QUANTIZED_TENSORS; i++) {
+        *qptrs[i] = qit;  qit += qelem[i];
+        *sptrs[i] = sit;  sit += selem[i];
+    }
+
+    // destination pointers for the 16 tensors (floatX pointers in params_memory)
+    void* float_ptrs[NUM_PARAMETER_TENSORS] = {
+        model->params.wte,      model->params.wpe,      model->params.ln1w,     model->params.ln1b,
+        model->params.qkvw,     model->params.qkvb,     model->params.attprojw, model->params.attprojb,
+        model->params.ln2w,     model->params.ln2b,     model->params.fcw,      model->params.fcb,
+        model->params.fcprojw,  model->params.fcprojb,  model->params.lnfw,     model->params.lnfb
+    };
+    void* int8_dst[NUM_PARAMETER_TENSORS] = {
+        nullptr, nullptr,                  nullptr, nullptr,
+        model->qparams.qkvw,     nullptr,  model->qparams.attprojw, nullptr,
+        nullptr, nullptr,                  model->qparams.fcw,       nullptr,
+        model->qparams.fcprojw,  nullptr,  nullptr, nullptr
+    };
+
+    // read 16 tensors from file
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        if (PARAM_IS_QUANTIZED[i]) {
+            file_to_device(int8_dst[i], f,
+                           model->param_elements[i] * sizeof(int8_t), IO_BUF_SIZE, main_stream);
+        } else {
+            file_to_device(float_ptrs[i], f,
+                           model->param_elements[i] * model->param_sizeof[i], IO_BUF_SIZE, main_stream);
+        }
+    }
+
+    // read scale arrays
+    const size_t scale_counts[NUM_QUANTIZED_TENSORS] = { L*3*C, L*C, L*4*C, L*C };
+    for (int i = 0; i < NUM_QUANTIZED_TENSORS; i++) {
+        file_to_device(*sptrs[i], f,
+                       scale_counts[i] * sizeof(float), IO_BUF_SIZE, main_stream);
+    }
+
+    fcloseCheck(f);
+    cudaCheck(cudaDeviceSynchronize());
+
+    cudaCheck(cudaMalloc((void**)&model->dequant_buffer, 4*C*C * sizeof(floatX)));
+    model->use_quantization = true;
+    printf0("Loaded quantized checkpoint from %s\n", path);
 }
 
 void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
@@ -715,9 +988,21 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
 
         // now do the forward pass
+        // When quantization is enabled, dequantize each layer's weight into dequant_buffer
+        // immediately before its matmul. The buffer is reused across all 4 calls — safe because
+        // kernels on main_stream execute in order, so each matmul finishes before the next
+        // dequantize overwrites the buffer.
+        if (model->use_quantization) {
+            dequantize_weights(model->dequant_buffer,
+                               model->qparams.qkvw + l * 3*C*C,
+                               model->qscales.qkvw  + l * 3*C,
+                               (int)(3*C), (int)C, main_stream);
+        }
+        const floatX* eff_qkvw = model->use_quantization ? model->dequant_buffer : l_qkvw;
+
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, eff_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
@@ -726,14 +1011,37 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward_cublaslt(scratch, l_ln1, eff_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
-        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        if (model->use_quantization) {
+            dequantize_weights(model->dequant_buffer,
+                               model->qparams.attprojw + l * C*C,
+                               model->qscales.attprojw  + l * C,
+                               (int)C, (int)C, main_stream);
+        }
+        const floatX* eff_attprojw = model->use_quantization ? model->dequant_buffer : l_attprojw;
+        matmul_forward_cublaslt(scratch, l_atty, eff_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+
+        if (model->use_quantization) {
+            dequantize_weights(model->dequant_buffer,
+                               model->qparams.fcw + l * 4*C*C,
+                               model->qscales.fcw  + l * 4*C,
+                               (int)(4*C), (int)C, main_stream);
+        }
+        const floatX* eff_fcw = model->use_quantization ? model->dequant_buffer : l_fcw;
+        matmul_forward_cublaslt(l_fch_gelu, l_ln2, eff_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+
+        if (model->use_quantization) {
+            dequantize_weights(model->dequant_buffer,
+                               model->qparams.fcprojw + l * C*4*C,
+                               model->qscales.fcprojw  + l * C,
+                               (int)C, (int)(4*C), main_stream);
+        }
+        const floatX* eff_fcprojw = model->use_quantization ? model->dequant_buffer : l_fcprojw;
+        matmul_forward_cublaslt(scratch, l_fch_gelu, eff_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -1404,6 +1712,8 @@ void error_usage() {
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    fprintf(stderr, "  -qi <int>   0=off, 1=quantize floatX checkpoint to INT8, 2=load already-quantized checkpoint\n");
+    fprintf(stderr, "  -qo <path>  save INT8 quantized checkpoint to this path (requires -qi 1)\n");
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
     fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
@@ -1447,6 +1757,8 @@ int main(int argc, char *argv[]) {
     int use_master_weights = 1;
     int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
+    int quantize = 0; // W8A16 INT8 weight quantization for inference (0 = off, 1 = on)
+    const char* quantize_output = NULL; // if set, write INT8 checkpoint here after quantizing
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
     // multi-node settings
@@ -1473,7 +1785,9 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'l' && argv[i][2] == '\0') { learning_rate = atof(argv[i+1]); }
         else if (argv[i][1] == 'l' && argv[i][2] == 'g') { log_gpu_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
+        else if (argv[i][1] == 'q' && argv[i][2] == '\0') { final_learning_rate_frac = atof(argv[i+1]); }
+        else if (argv[i][1] == 'q' && argv[i][2] == 'i') { quantize = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'q' && argv[i][2] == 'o') { quantize_output = argv[i+1]; }
         else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
@@ -1547,6 +1861,7 @@ int main(int argc, char *argv[]) {
     printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
     printf0("| gelu_fusion           | %-50d |\n", gelu_fusion);
     printf0("| recompute             | %-50d |\n", recompute);
+    printf0("| quantization          | %-50s |\n", quantize == 2 ? "INT8 W8A16 (load)" : quantize == 1 ? "INT8 W8A16 (quantize)" : "disabled");
     printf0("+-----------------------+----------------------------------------------------+\n");
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
@@ -1576,6 +1891,9 @@ int main(int argc, char *argv[]) {
         // if we are using master weights, we'll init them later inside load_state()
         bool weight_init = !use_master_weights;
         gpt2_build_from_checkpoint(&model, filename_buffer, weight_init);
+    } else if (ends_with_bin(load_filename) && quantize == 2) {
+        // -qi 2 signals the file is already a quantized (version 7) checkpoint
+        gpt2_build_from_quantized_checkpoint(&model, load_filename);
     } else if (ends_with_bin(load_filename)) {
         // otherwise, if this is a .bin file, we assume it's a model, let's init from it
         gpt2_build_from_checkpoint(&model, load_filename);
@@ -1675,6 +1993,12 @@ int main(int argc, char *argv[]) {
     // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
     gpt2_allocate_state(&model, B, T);
+    if (quantize == 1) {
+        gpt2_quantize_weights(&model, main_stream);
+        if (quantize_output != NULL) {
+            gpt2_write_quantized_checkpoint(&model, quantize_output);
+        }
+    }
     if (resuming == 1) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
         load_state(&step, &model, &train_loader, filename_buffer);
