@@ -236,6 +236,141 @@ void ptq_dequantize_rows(floatX* dst, const uint8_t* src, const float* scales, i
     cudaCheck(cudaGetLastError());
 }
 
+// ----------------------------------------------------------------------------
+// GPU-side row-wise quantization (beast mode: no host round-trip)
+
+// Pass 1a: find max |value| per row, floatX source.
+// One block per row, 256 threads cooperate via shared-memory reduction.
+__global__ void ptq_find_row_max_kernel(float* __restrict__ row_maxes,
+                                        const floatX* __restrict__ src,
+                                        int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const floatX* row_src = src + (size_t)row * cols;
+    float local_max = 0.0f;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf((float)row_src[col]));
+    }
+    __shared__ float sdata[256];
+    sdata[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) row_maxes[row] = sdata[0];
+}
+
+// Pass 1b: same but from FP32 source (used when re-quantizing from master_weights).
+__global__ void ptq_find_row_max_fp32_kernel(float* __restrict__ row_maxes,
+                                              const float* __restrict__ src,
+                                              int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* row_src = src + (size_t)row * cols;
+    float local_max = 0.0f;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(row_src[col]));
+    }
+    __shared__ float sdata[256];
+    sdata[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) row_maxes[row] = sdata[0];
+}
+
+// Pass 1c: convert row_maxes → scales.
+__global__ void ptq_write_scales_kernel(float* scales, const float* row_maxes,
+                                        int rows, float quant_max) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float m = row_maxes[row];
+    scales[row] = (m > 0.0f) ? (m / quant_max) : 1.0f;
+}
+
+// Pass 2a: quantize from floatX using precomputed scales.
+__global__ void ptq_quantize_apply_kernel(uint8_t* __restrict__ dst,
+                                          const floatX* __restrict__ src,
+                                          const float* __restrict__ scales,
+                                          int rows, int cols, PTQPrecision precision) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int row = idx / cols;
+    float val = (float)src[idx] / scales[row];
+    if (precision == PTQ_PRECISION_INT8) {
+        int q = (int)lrintf(fmaxf(-127.0f, fminf(127.0f, val)));
+        dst[idx] = (uint8_t)((int8_t)q);
+    } else {
+        dst[idx] = ptq_encode_fp8_e4m3(val);
+    }
+}
+
+// Pass 2b: quantize from FP32 using precomputed scales.
+__global__ void ptq_quantize_apply_fp32_kernel(uint8_t* __restrict__ dst,
+                                               const float* __restrict__ src,
+                                               const float* __restrict__ scales,
+                                               int rows, int cols, PTQPrecision precision) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int row = idx / cols;
+    float val = src[idx] / scales[row];
+    if (precision == PTQ_PRECISION_INT8) {
+        int q = (int)lrintf(fmaxf(-127.0f, fminf(127.0f, val)));
+        dst[idx] = (uint8_t)((int8_t)q);
+    } else {
+        dst[idx] = ptq_encode_fp8_e4m3(val);
+    }
+}
+
+// GPU quantize from floatX. row_maxes_scratch is a caller-owned device buffer of `rows` floats.
+void ptq_quantize_rows_gpu(uint8_t* dst, float* scales, float* row_maxes_scratch,
+                            const floatX* src, int rows, int cols,
+                            PTQPrecision precision, cudaStream_t stream) {
+    const float quant_max = (precision == PTQ_PRECISION_INT8) ? 127.0f : FP8_E4M3_MAX;
+    ptq_find_row_max_kernel<<<rows, 256, 0, stream>>>(row_maxes_scratch, src, rows, cols);
+    cudaCheck(cudaGetLastError());
+    ptq_write_scales_kernel<<<CEIL_DIV(rows, 256), 256, 0, stream>>>(
+        scales, row_maxes_scratch, rows, quant_max);
+    cudaCheck(cudaGetLastError());
+    ptq_quantize_apply_kernel<<<CEIL_DIV(rows * cols, 256), 256, 0, stream>>>(
+        dst, src, scales, rows, cols, precision);
+    cudaCheck(cudaGetLastError());
+}
+
+// GPU quantize from FP32 master weights. row_maxes_scratch: device buffer of `rows` floats.
+void ptq_quantize_rows_gpu_fp32(uint8_t* dst, float* scales, float* row_maxes_scratch,
+                                const float* src, int rows, int cols,
+                                PTQPrecision precision, cudaStream_t stream) {
+    const float quant_max = (precision == PTQ_PRECISION_INT8) ? 127.0f : FP8_E4M3_MAX;
+    ptq_find_row_max_fp32_kernel<<<rows, 256, 0, stream>>>(row_maxes_scratch, src, rows, cols);
+    cudaCheck(cudaGetLastError());
+    ptq_write_scales_kernel<<<CEIL_DIV(rows, 256), 256, 0, stream>>>(
+        scales, row_maxes_scratch, rows, quant_max);
+    cudaCheck(cudaGetLastError());
+    ptq_quantize_apply_fp32_kernel<<<CEIL_DIV(rows * cols, 256), 256, 0, stream>>>(
+        dst, src, scales, rows, cols, precision);
+    cudaCheck(cudaGetLastError());
+}
+
+// Dequantize one layer-slice from a QuantizedTensor into dst (device floatX).
+// For non-layered tensors pass layer=0; rows_per_layer should equal total rows.
+void ptq_dequantize_layer_slice(floatX* dst, const QuantizedTensor* qt,
+                                int layer, PTQPrecision precision, cudaStream_t stream) {
+    const int rows = qt->rows_per_layer;
+    const int cols = qt->cols;
+    const size_t elem_offset  = (size_t)layer * rows * cols;
+    const size_t scale_offset = (size_t)layer * rows;
+    ptq_dequantize_rows(dst,
+                        qt->qvalues + elem_offset,
+                        qt->scales  + scale_offset,
+                        rows, cols, precision, stream);
+}
+
 typedef struct {
     // All learnable weights are stored in floatX on device:
     // - FP32 build: float
@@ -306,15 +441,15 @@ const char* parameter_tensor_name(int tensor_id) {
 }
 
 bool ptq_should_quantize_tensor(int tensor_id) {
-    // Keep this strictly weight-only: large 2D weights and embeddings only.
-    // Biases and LayerNorm weights are tiny and not worth the added error/noise.
+    // Beast mode: only quantize the large transformer weight matrices.
+    // wte and wpe stay as floatX: encoder_forward needs random-access gather,
+    // and wte is also the weight-tied classifier — both are accessed lookup-style.
+    // Biases and LayerNorm weights are tiny; quantizing them adds error for no gain.
     switch (tensor_id) {
-        case 0:  // wte
-        case 1:  // wpe
-        case 4:  // qkvw
-        case 6:  // attprojw
-        case 10: // fcw
-        case 12: // fcprojw
+        case 4:  // qkvw   (L, 3C, C)
+        case 6:  // attprojw (L, C, C)
+        case 10: // fcw    (L, 4C, C)
+        case 12: // fcprojw (L, C, 4C)
             return true;
         default:
             return false;
@@ -552,10 +687,21 @@ typedef struct {
     bool init_state;   // set to true if master weights need to be initialized
     int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
-    // optional row-wise PTQ shadow for the large weight tensors only
+    // Beast-mode PTQ: quantized storage for large transformer weight matrices.
+    // params.qkvw / attprojw / fcw / fcprojw are NULL at runtime;
+    // they live in ptq.tensors[i] as (qvalues + scales) and are dequantized
+    // on-demand per-layer into scratch_dequant during forward/backward.
     int ptq_enabled;
     PTQPrecision ptq_precision;
     QuantizedParameters ptq;
+    // Per-layer dequant scratch: large enough for the biggest single-layer quantized weight
+    // (fcw/fcprojw = 4*C*C floatX). Reused every layer, every step.
+    floatX* scratch_dequant;
+    size_t  scratch_dequant_elems; // capacity in elements
+    // Row-max scratch for GPU quantization (used in prepare and after each update).
+    // Sized for the maximum number of rows across all quantized tensors.
+    float*  row_maxes_scratch;
+    size_t  row_maxes_scratch_elems;
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
@@ -594,6 +740,11 @@ void gpt2_init_common(GPT2 *model) {
     model->m_memory = NULL;
     model->v_memory = NULL;
     model->master_weights = NULL;
+    // beast-mode PTQ scratch (allocated in gpt2_prepare_ptq and gpt2_allocate_state)
+    model->scratch_dequant = NULL;
+    model->scratch_dequant_elems = 0;
+    model->row_maxes_scratch = NULL;
+    model->row_maxes_scratch_elems = 0;
     // other default settings
     model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
     // In BF16 mode this is the important safeguard: update the FP32 master copy,
@@ -607,6 +758,14 @@ void gpt2_init_common(GPT2 *model) {
     model->ptq = {};
 }
 
+// Beast-mode PTQ setup.
+// Called once after weights are loaded into params_memory.
+// For each quantized tensor (qkvw, attprojw, fcw, fcprojw):
+//   1. GPU-quantizes the floatX weights into qvalues + scales (no host copy).
+//   2. Builds a compact new params_memory containing only the unquantized tensors.
+//   3. Frees the original large params_memory block.
+//   4. Sets the quantized params.* pointers to NULL so forward/backward
+//      must dequantize on-demand into scratch_dequant.
 void gpt2_prepare_ptq(GPT2 *model) {
     if (!model->ptq_enabled || model->ptq_precision == PTQ_PRECISION_NONE) {
         gpt2_clear_ptq(model);
@@ -621,67 +780,117 @@ void gpt2_prepare_ptq(GPT2 *model) {
         exit(EXIT_FAILURE);
     }
 
+    // ------------------------------------------------------------------ //
+    // Step 1: figure out scratch sizes needed across all quantized tensors
+    // ------------------------------------------------------------------ //
+    size_t max_rows = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+        if (!ptq_should_quantize_tensor(i)) continue;
+        PTQTensorLayout layout = ptq_tensor_layout_for_index(model->config, i);
+        size_t total_rows = (size_t)layout.num_layers * layout.rows_per_layer;
+        if (total_rows > max_rows) max_rows = total_rows;
+    }
+    // Allocate row_maxes_scratch if not already done
+    if (model->row_maxes_scratch == nullptr || model->row_maxes_scratch_elems < max_rows) {
+        cudaFreeCheck(&model->row_maxes_scratch);
+        cudaCheck(cudaMalloc((void**)&model->row_maxes_scratch, max_rows * sizeof(float)));
+        model->row_maxes_scratch_elems = max_rows;
+    }
+
+    // ------------------------------------------------------------------ //
+    // Step 2: GPU-quantize each transformer weight tensor into qvalues/scales
+    // ------------------------------------------------------------------ //
     floatX** src_ptrs[NUM_PARAMETER_TENSORS];
     get_parameter_tensor_ptrs(&model->params, src_ptrs);
 
-    if (!model->ptq.initialized) {
-        model->ptq.original_weight_bytes = 0;
-        model->ptq.quantized_weight_bytes = 0;
-        model->ptq.num_quantized_tensors = 0;
-    }
+    model->ptq.original_weight_bytes = 0;
+    model->ptq.quantized_weight_bytes = 0;
+    model->ptq.num_quantized_tensors  = 0;
 
     for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
-        if (!ptq_should_quantize_tensor(i)) {
-            continue;
-        }
+        if (!ptq_should_quantize_tensor(i)) continue;
         PTQTensorLayout layout = ptq_tensor_layout_for_index(model->config, i);
-        const size_t total_rows = (size_t)layout.num_layers * layout.rows_per_layer;
+        const size_t total_rows     = (size_t)layout.num_layers * layout.rows_per_layer;
         const size_t total_elements = total_rows * layout.cols;
         assert(total_elements == model->param_elements[i]);
 
-        floatX* tensor_host_raw = (floatX*)mallocCheck(total_elements * sizeof(floatX));
-        float* tensor_host = (float*)mallocCheck(total_elements * sizeof(float));
-        uint8_t* qvalues_host = (uint8_t*)mallocCheck(total_elements * sizeof(uint8_t));
-        float* scales_host = (float*)mallocCheck(total_rows * sizeof(float));
-
-        cudaCheck(cudaMemcpy(tensor_host_raw, *src_ptrs[i], total_elements * sizeof(floatX), cudaMemcpyDeviceToHost));
-        for (size_t j = 0; j < total_elements; ++j) {
-            tensor_host[j] = (float)tensor_host_raw[j];
-        }
-        ptq_quantize_rows_host(qvalues_host, scales_host, tensor_host, (int)total_rows, layout.cols, model->ptq_precision);
-
-        QuantizedTensor* qtensor = &model->ptq.tensors[i];
-        if (!qtensor->initialized) {
-            cudaCheck(cudaMalloc((void**)&qtensor->qvalues, total_elements * sizeof(uint8_t)));
-            cudaCheck(cudaMalloc((void**)&qtensor->scales, total_rows * sizeof(float)));
-            qtensor->num_layers = layout.num_layers;
-            qtensor->rows_per_layer = layout.rows_per_layer;
-            qtensor->cols = layout.cols;
-            qtensor->initialized = true;
-
+        QuantizedTensor* qt = &model->ptq.tensors[i];
+        if (!qt->initialized) {
+            cudaCheck(cudaMalloc((void**)&qt->qvalues, total_elements * sizeof(uint8_t)));
+            cudaCheck(cudaMalloc((void**)&qt->scales,  total_rows     * sizeof(float)));
+            qt->num_layers     = layout.num_layers;
+            qt->rows_per_layer = layout.rows_per_layer;
+            qt->cols           = layout.cols;
+            qt->initialized    = true;
             model->ptq.original_weight_bytes += total_elements * sizeof(floatX);
-            model->ptq.quantized_weight_bytes += total_elements * sizeof(uint8_t) + total_rows * sizeof(float);
+            model->ptq.quantized_weight_bytes += total_elements * sizeof(uint8_t)
+                                               + total_rows     * sizeof(float);
             model->ptq.num_quantized_tensors += 1;
-        } else {
-            assert(qtensor->num_layers == layout.num_layers);
-            assert(qtensor->rows_per_layer == layout.rows_per_layer);
-            assert(qtensor->cols == layout.cols);
         }
-        cudaCheck(cudaMemcpy(qtensor->qvalues, qvalues_host, total_elements * sizeof(uint8_t), cudaMemcpyHostToDevice));
-        cudaCheck(cudaMemcpy(qtensor->scales, scales_host, total_rows * sizeof(float), cudaMemcpyHostToDevice));
-
-        // Keep params_memory as the runtime weight view, but constrain it to the quantized lattice.
-        ptq_dequantize_rows(*src_ptrs[i], qtensor->qvalues, qtensor->scales,
-                            (int)total_rows, layout.cols, model->ptq_precision, main_stream);
-
-        free(tensor_host_raw);
-        free(tensor_host);
-        free(qvalues_host);
-        free(scales_host);
+        // GPU-quantize: floatX params -> uint8 qvalues + float scales
+        ptq_quantize_rows_gpu(qt->qvalues, qt->scales, model->row_maxes_scratch,
+                              *src_ptrs[i], (int)total_rows, layout.cols,
+                              model->ptq_precision, main_stream);
     }
-
     cudaCheck(cudaStreamSynchronize(main_stream));
     model->ptq.initialized = true;
+
+    // ------------------------------------------------------------------ //
+    // Step 3: Build a compact params_memory holding ONLY unquantized tensors.
+    // ------------------------------------------------------------------ //
+    // Calculate size of the compact block
+    size_t compact_bytes = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+        if (!ptq_should_quantize_tensor(i))
+            compact_bytes += model->param_elements[i] * model->param_sizeof[i];
+    }
+    void* compact_memory;
+    cudaCheck(cudaMalloc(&compact_memory, compact_bytes));
+
+    // Copy each unquantized tensor from the old block into the new compact block,
+    // and update the params.* pointer to point into the new block.
+    floatX** ptrs[NUM_PARAMETER_TENSORS];
+    get_parameter_tensor_ptrs(&model->params, ptrs);
+    char* compact_iter = (char*)compact_memory;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+        size_t tensor_bytes = model->param_elements[i] * model->param_sizeof[i];
+        if (ptq_should_quantize_tensor(i)) {
+            // Quantized tensor: clear the pointer so any accidental access is caught.
+            *(ptrs[i]) = nullptr;
+        } else {
+            cudaCheck(cudaMemcpyAsync(compact_iter, *(ptrs[i]), tensor_bytes,
+                                     cudaMemcpyDeviceToDevice, main_stream));
+            *(ptrs[i]) = (floatX*)compact_iter;
+            compact_iter += tensor_bytes;
+        }
+    }
+    cudaCheck(cudaStreamSynchronize(main_stream));
+
+    // Free the original large params_memory and install the compact one
+    cudaCheck(cudaFree(model->params_memory));
+    model->params_memory = compact_memory;
+
+    // ------------------------------------------------------------------ //
+    // Step 4: allocate scratch_dequant (max single-layer quantized weight size)
+    // ------------------------------------------------------------------ //
+    // Largest single-layer tensor: fcw = 4*C*C, fcprojw = C*4*C (same size)
+    size_t max_layer_elems = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+        if (!ptq_should_quantize_tensor(i)) continue;
+        PTQTensorLayout layout = ptq_tensor_layout_for_index(model->config, i);
+        size_t layer_elems = (size_t)layout.rows_per_layer * layout.cols;
+        if (layer_elems > max_layer_elems) max_layer_elems = layer_elems;
+    }
+    if (model->scratch_dequant == nullptr || model->scratch_dequant_elems < max_layer_elems) {
+        cudaFreeCheck(&model->scratch_dequant);
+        cudaCheck(cudaMalloc((void**)&model->scratch_dequant,
+                             max_layer_elems * sizeof(floatX)));
+        model->scratch_dequant_elems = max_layer_elems;
+    }
+    printf0("[beast-ptq] quantized %d tensors; freed %.1f MiB, kept %.1f MiB floatX params\n",
+            model->ptq.num_quantized_tensors,
+            (double)model->ptq.original_weight_bytes / (1024.0*1024.0),
+            (double)compact_bytes / (1024.0*1024.0));
 }
 
 void gpt2_print_ptq_summary(const GPT2 *model) {
@@ -795,15 +1004,28 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
 }
 
 void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
-    // write the model to a checkpoint file
     printf0("Writing model to %s\n", checkpoint_path);
     FILE *model_file = fopenCheck(checkpoint_path, "wb");
-    // write the header first
+    // write the header
     int model_header[256];
     memset(model_header, 0, sizeof(model_header));
     model_header[0] = 20240326; // magic number
     assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
-    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5; // version
+    // Version encoding:
+    //   3 = fp32, padded vocab (original)
+    //   5 = bf16, padded vocab, layernorms in bf16 (original)
+    //   7 = fp32 + beast-mode int8 PTQ
+    //   8 = bf16 + beast-mode int8 PTQ
+    //   9 = fp32 + beast-mode fp8 PTQ
+    //  10 = bf16 + beast-mode fp8 PTQ
+    bool beast = model->ptq_enabled && model->ptq.initialized;
+    if (!beast) {
+        model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5;
+    } else {
+        int base = PRECISION_MODE == PRECISION_FP32 ? 7 : 8;
+        model_header[1] = base + (model->ptq_precision == PTQ_PRECISION_FP8 ? 2 : 0);
+        model_header[8] = (int)model->ptq_precision; // store precision enum in header
+    }
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
     model_header[4] = model->config.num_layers;
@@ -811,45 +1033,58 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
     fwriteCheck(model_header, sizeof(int), 256, model_file);
-    // write the parameters
-    device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
-                   IO_BUF_SIZE, main_stream);
-    // close file, we're done
+
+    if (!beast) {
+        // Original path: dump the full floatX params_memory blob.
+        device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
+                       IO_BUF_SIZE, main_stream);
+    } else {
+        // Beast path: write each tensor in its canonical stored form.
+        // Unquantized tensors are written as floatX from params_memory.
+        // Quantized tensors are written as (qvalues: uint8) then (scales: float).
+        floatX** ptrs[NUM_PARAMETER_TENSORS];
+        get_parameter_tensor_ptrs(&model->params, ptrs);
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+            if (!ptq_should_quantize_tensor(i)) {
+                size_t bytes = model->param_elements[i] * sizeof(floatX);
+                device_to_file(model_file, *(ptrs[i]), bytes, IO_BUF_SIZE, main_stream);
+            } else {
+                const QuantizedTensor* qt = &model->ptq.tensors[i];
+                size_t total_rows = (size_t)qt->num_layers * qt->rows_per_layer;
+                size_t qbytes     = (size_t)total_rows * qt->cols * sizeof(uint8_t);
+                size_t sbytes     = total_rows * sizeof(float);
+                device_to_file(model_file, qt->qvalues, qbytes, IO_BUF_SIZE, main_stream);
+                device_to_file(model_file, qt->scales,  sbytes, IO_BUF_SIZE, main_stream);
+            }
+        }
+    }
     fcloseCheck(model_file);
 }
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool weight_init=true) {
-    // If weight_init is true, we will load the weights from this checkpoint .bin file
-    // We sometimes want this to be false, if we are going to initialize these weights from
-    // the master weights that are instead stored in the state .bin file.
-    // In that case, this function mostly loads the model hyperparameters from the header.
+    // If weight_init is true, load weights from this .bin checkpoint.
+    // weight_init=false is used when weights will be restored from FP32 master weights in the state file.
 
     if (PRECISION_MODE == PRECISION_FP16) {
-        // TODO for later perhaps, would require us dynamically converting the
-        // model weights from fp32 to fp16 online, here in this function, or writing
-        // the fp16 weights directly from Python, which we only do for fp32/bf16 atm.
         fprintf(stderr, "build_from_checkpoint() does not support fp16 right now.\n");
         exit(EXIT_FAILURE);
     }
 
-    // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
     int version = model_header[1];
-    if (!(version == 3 || version == 5)) {
-        // 3 = fp32, padded vocab
-        // 5 = bf16, padded vocab, layernorms also in bf16
+    // Accepted versions:
+    //  3 = fp32 (original)       5 = bf16 (original)
+    //  7/8 = fp32/bf16 + beast int8    9/10 = fp32/bf16 + beast fp8
+    bool is_beast_ckpt = (version >= 7 && version <= 10);
+    if (!(version == 3 || version == 5 || is_beast_ckpt)) {
         fprintf(stderr, "Bad version in model file\n");
         fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(EXIT_FAILURE);
     }
-
-    // The stored checkpoint precision must match the build precision because params_memory
-    // is allocated as raw floatX and then filled directly from file bytes.
-    // There is no generic on-load cast here except through the separate master-weight restore path.
-    if (weight_init) {
+    if (weight_init && !is_beast_ckpt) {
         if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
             fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
             fprintf(stderr, "---> HINT: are you sure you're loading a _bf16.bin file?\n");
@@ -857,33 +1092,103 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
         }
         if (PRECISION_MODE == PRECISION_FP32 && version != 3) {
             fprintf(stderr, "Precision is configured as FP32 but model at %s is not.\n", checkpoint_path);
-            fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2cu PRECISION=FP32`\n");
-            fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
+            fprintf(stderr, "---> HINT: compile with `make train_gpt2cu PRECISION=FP32`\n");
             exit(EXIT_FAILURE);
         }
     }
 
-    // read in hyperparameters
-    model->config.max_seq_len = model_header[2];
-    model->config.vocab_size = model_header[3];
-    model->config.num_layers = model_header[4];
-    model->config.num_heads = model_header[5];
-    model->config.channels = model_header[6];
+    model->config.max_seq_len       = model_header[2];
+    model->config.vocab_size        = model_header[3];
+    model->config.num_layers        = model_header[4];
+    model->config.num_heads         = model_header[5];
+    model->config.channels          = model_header[6];
     model->config.padded_vocab_size = model_header[7];
 
-    // allocate memory for the model parameters
+    // Allocate full params_memory (needed as landing buffer; gpt2_prepare_ptq compacts it later
+    // when PTQ is enabled from a fresh .bin, or we compact inline below for beast checkpoints).
     gpt2_allocate_weights(model);
 
-    // read in the parameters if weight_init is true
     if (weight_init) {
         assert(model->params_memory != NULL);
-        file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
+        if (!is_beast_ckpt) {
+            // Original format: one contiguous floatX blob.
+            file_to_device(model->params_memory, model_file, model->num_parameters_bytes,
+                           IO_BUF_SIZE, main_stream);
+        } else {
+            // Beast format: tensor-by-tensor.
+            // Unquantized tensors → loaded as floatX into params.* slots.
+            // Quantized tensors   → loaded as (qvalues uint8, scales float) into ptq.tensors[i].
+            PTQPrecision ckpt_prec = (PTQPrecision)model_header[8];
+            floatX** ptrs[NUM_PARAMETER_TENSORS];
+            get_parameter_tensor_ptrs(&model->params, ptrs);
+            for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+                PTQTensorLayout layout = ptq_tensor_layout_for_index(model->config, i);
+                size_t total_rows     = (size_t)layout.num_layers * layout.rows_per_layer;
+                size_t total_elements = total_rows * layout.cols;
+                if (!ptq_should_quantize_tensor(i)) {
+                    size_t bytes = model->param_elements[i] * sizeof(floatX);
+                    file_to_device(*(ptrs[i]), model_file, bytes, IO_BUF_SIZE, main_stream);
+                } else {
+                    QuantizedTensor* qt = &model->ptq.tensors[i];
+                    if (!qt->initialized) {
+                        cudaCheck(cudaMalloc((void**)&qt->qvalues, total_elements * sizeof(uint8_t)));
+                        cudaCheck(cudaMalloc((void**)&qt->scales,  total_rows     * sizeof(float)));
+                        qt->num_layers     = layout.num_layers;
+                        qt->rows_per_layer = layout.rows_per_layer;
+                        qt->cols           = layout.cols;
+                        qt->initialized    = true;
+                    }
+                    file_to_device(qt->qvalues, model_file, total_elements * sizeof(uint8_t),
+                                   IO_BUF_SIZE, main_stream);
+                    file_to_device(qt->scales,  model_file, total_rows     * sizeof(float),
+                                   IO_BUF_SIZE, main_stream);
+                }
+            }
+            model->ptq.initialized = true;
+            cudaCheck(cudaStreamSynchronize(main_stream));
+
+            // Compact params_memory: keep only unquantized tensors, null quantized ptrs.
+            size_t compact_bytes = 0;
+            for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i)
+                if (!ptq_should_quantize_tensor(i))
+                    compact_bytes += model->param_elements[i] * model->param_sizeof[i];
+            void* compact_memory;
+            cudaCheck(cudaMalloc(&compact_memory, compact_bytes));
+            char* cit = (char*)compact_memory;
+            for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+                size_t tb = model->param_elements[i] * model->param_sizeof[i];
+                if (ptq_should_quantize_tensor(i)) {
+                    *(ptrs[i]) = nullptr;
+                } else {
+                    cudaCheck(cudaMemcpyAsync(cit, *(ptrs[i]), tb,
+                                             cudaMemcpyDeviceToDevice, main_stream));
+                    *(ptrs[i]) = (floatX*)cit;
+                    cit += tb;
+                }
+            }
+            cudaCheck(cudaStreamSynchronize(main_stream));
+            cudaCheck(cudaFree(model->params_memory));
+            model->params_memory = compact_memory;
+
+            // Allocate scratch_dequant for per-layer forward/backward dequant.
+            size_t max_le = 0;
+            for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+                if (!ptq_should_quantize_tensor(i)) continue;
+                PTQTensorLayout lo = ptq_tensor_layout_for_index(model->config, i);
+                size_t le = (size_t)lo.rows_per_layer * lo.cols;
+                if (le > max_le) max_le = le;
+            }
+            if (model->scratch_dequant == nullptr || model->scratch_dequant_elems < max_le) {
+                cudaFreeCheck(&model->scratch_dequant);
+                cudaCheck(cudaMalloc((void**)&model->scratch_dequant, max_le * sizeof(floatX)));
+                model->scratch_dequant_elems = max_le;
+            }
+        }
     }
     fcloseCheck(model_file);
-
-    // only return from this function once we are certain the params are ready on the GPU
     cudaCheck(cudaDeviceSynchronize());
 }
+
 
 void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
     int depth = atoi(depth_str);
@@ -1061,17 +1366,25 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
-        // get the pointers of the weights for this layer
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_qkvb = params.qkvb + l * 3*C;
-        floatX* l_attprojw = params.attprojw + l * C * C;
+        // In beast mode, quantized weight ptrs (qkvw, attprojw, fcw, fcprojw) are NULL.
+        // We dequantize each one into scratch_dequant immediately before use.
+        // In non-PTQ mode, params.* are valid and we use them directly.
+        bool beast = model->ptq_enabled && model->ptq.initialized;
+        floatX* sd = model->scratch_dequant; // alias for readability
+
+        // -- non-quantized weight pointers (always valid) --
+        floatX* l_qkvb     = params.qkvb     + l * 3*C;
         floatX* l_attprojb = params.attprojb + l * C;
-        floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
-        floatX* l_fcprojb = params.fcprojb + l * C;
+        floatX* l_ln2w     = params.ln2w     + l * C;
+        floatX* l_ln2b     = params.ln2b     + l * C;
+        floatX* l_fcb      = params.fcb      + l * 4*C;
+        floatX* l_fcprojb  = params.fcprojb  + l * C;
+
+        // -- quantized weight pointers (valid only when !beast) --
+        floatX* l_qkvw     = beast ? nullptr : params.qkvw     + l * 3*C * C;
+        floatX* l_attprojw = beast ? nullptr : params.attprojw + l * C * C;
+        floatX* l_fcw      = beast ? nullptr : params.fcw      + l * 4*C * C;
+        floatX* l_fcprojw  = beast ? nullptr : params.fcprojw  + l * C * 4*C;
 
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
@@ -1082,34 +1395,50 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
-        // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
-        // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
 
-        // Attention/MLP weights and activations are floatX, but the heavy GEMMs are still
-        // accumulated by cuBLASLt in FP32. For quantization work, these matmul call sites
-        // are the most important seams to intercept/replace.
+        // ---------- QKV matmul ----------
+        if (beast) {
+            ptq_dequantize_layer_slice(sd, &model->ptq.tensors[4], l, model->ptq_precision, main_stream);
+            l_qkvw = sd;
+        }
         #ifdef ENABLE_CUDNN
-        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
+        float* l_att = (float*)acts.att + l * B * NH * T;
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
-        if (T != model->seq_len) { // unused parts of attention buffer must be zeroed (T-dependent)
+        if (T != model->seq_len) {
             cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
         }
-        // these are only needed as scratchpads for the forward pass, but
-        // need not be stored for backward
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
+        // ---------- attention projection ----------
+        if (beast) {
+            ptq_dequantize_layer_slice(sd, &model->ptq.tensors[6], l, model->ptq_precision, main_stream);
+            l_attprojw = sd;
+        }
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
+
+        // ---------- MLP up-projection (fc) ----------
+        if (beast) {
+            ptq_dequantize_layer_slice(sd, &model->ptq.tensors[10], l, model->ptq_precision, main_stream);
+            l_fcw = sd;
+        }
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+
+        // ---------- MLP down-projection (fcproj) ----------
+        if (beast) {
+            ptq_dequantize_layer_slice(sd, &model->ptq.tensors[12], l, model->ptq_precision, main_stream);
+            l_fcprojw = sd;
+        }
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -1126,11 +1455,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
     }
 
-    // Final logits are written in floatX as well. The fused classifier kernel later reads
-    // them and internally promotes as needed for softmax / cross-entropy math.
+    // Final logits. wte is always floatX (never nulled by beast mode).
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
 }
+
 
 
 // Forwards both the model and the loss and is used for validation splits and evals.
@@ -1231,28 +1560,35 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
-        // get the pointers of the weights for this layer
+        bool beast = model->ptq_enabled && model->ptq.initialized;
+        floatX* sd = model->scratch_dequant;
+
+        // -- non-quantized weight pointers (always valid) --
         floatX* l_ln1w = params.ln1w + l * C;
         floatX* l_ln1b = params.ln1b + l * C;
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
+
+        // -- quantized weight pointers (valid only when !beast; set to scratch on demand below) --
+        floatX* l_qkvw     = beast ? nullptr : params.qkvw     + l * 3*C * C;
+        floatX* l_attprojw = beast ? nullptr : params.attprojw + l * C * C;
+        floatX* l_fcw      = beast ? nullptr : params.fcw      + l * 4*C * C;
+        floatX* l_fcprojw  = beast ? nullptr : params.fcprojw  + l * C * 4*C;
+
         // get the pointers of the gradients of the weights for this layer
-        floatX* dl_ln1w = grads.ln1w + l * C;
-        floatX* dl_ln1b = grads.ln1b + l * C;
-        floatX* dl_qkvw = grads.qkvw + l * 3*C * C;
-        floatX* dl_qkvb = grads.qkvb + l * 3*C;
+        floatX* dl_ln1w    = grads.ln1w    + l * C;
+        floatX* dl_ln1b    = grads.ln1b    + l * C;
+        floatX* dl_qkvw    = grads.qkvw    + l * 3*C * C;
+        floatX* dl_qkvb    = grads.qkvb    + l * 3*C;
         floatX* dl_attprojw = grads.attprojw + l * C * C;
         floatX* dl_attprojb = grads.attprojb + l * C;
-        floatX* dl_ln2w = grads.ln2w + l * C;
-        floatX* dl_ln2b = grads.ln2b + l * C;
-        floatX* dl_fcw = grads.fcw + l * 4*C * C;
-        floatX* dl_fcb = grads.fcb + l * 4*C;
+        floatX* dl_ln2w    = grads.ln2w    + l * C;
+        floatX* dl_ln2b    = grads.ln2b    + l * C;
+        floatX* dl_fcw     = grads.fcw     + l * 4*C * C;
+        floatX* dl_fcb     = grads.fcb     + l * 4*C;
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
         floatX* dl_fcprojb = grads.fcprojb + l * C;
+
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
@@ -1265,44 +1601,60 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch_pre_gelu = acts.fch + l * B * T * 4*C;
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
-        // get the pointers of the gradients of the activations for this layer
-        // notice that there is no l *, because we just have a single copy, and keep
-        // re-using this memory in every Transformer block as we calculate backward pass
 
         floatX* dl_bt4c = (floatX*)model->acts.scratch_bt4c;
 
         // start the backward pass for this layer
         if(model->recompute >= 1) {
-            // recompute >= 1 means we recompute gelu. in this case,
-            // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
             gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
         }
+
+        // ---------- fcprojw backward ----------
+        if (beast) {
+            ptq_dequantize_layer_slice(sd, &model->ptq.tensors[12], l, model->ptq_precision, main_stream);
+            l_fcprojw = sd;
+        }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
+
         if(model->recompute >= 2) {
-            // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
             layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
         }
+
+        // ---------- fcw backward ----------
+        if (beast) {
+            ptq_dequantize_layer_slice(sd, &model->ptq.tensors[10], l, model->ptq_precision, main_stream);
+            l_fcw = sd;
+        }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
-        // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
+
+        // ---------- attprojw backward ----------
+        if (beast) {
+            ptq_dequantize_layer_slice(sd, &model->ptq.tensors[6], l, model->ptq_precision, main_stream);
+            l_attprojw = sd;
+        }
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
 
         #ifdef ENABLE_CUDNN
-        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
+        float* l_att = (float*)acts.att + l * B * NH * T;
         attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
-        // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
-        floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
+        floatX* buffer_b = l_fch_pre_gelu;
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
+
         if(model->recompute >= 2) {
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
         }
-        // QKV parameter gradients
+
+        // ---------- qkvw backward ----------
+        if (beast) {
+            ptq_dequantize_layer_slice(sd, &model->ptq.tensors[4], l, model->ptq_precision, main_stream);
+            l_qkvw = sd;
+        }
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
-        // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
 
         // Accumulate gradients from this layer in a background stream.
@@ -1441,62 +1793,118 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // - read gradient from floatX and promote to float
     // - update m and v in float
     // - update parameter in float, preferably from master_weights
-    // - stochastic-round the new value back into floatX for the next forward pass
-    // This is the other half of the current mixed-precision design.
-    // handle adamw for all the transformer blocks
+    // - stochastic-round the new value back into floatX for next forward pass
+    //   (for beast mode: the floatX output is thrown away; we requantize from master_weights instead)
+    bool beast = model->ptq_enabled && model->ptq.initialized;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        // generate a unique seed for each tensor
         unsigned int seed = random_u32(&model->rng_state);
 
         int num_layers = model->config.num_layers;
-        if((i < 2 || i > 13)) {
-            num_layers = 1;
-        }
+        if((i < 2 || i > 13)) { num_layers = 1; }
 
         ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
-        ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
-        ptrdiff_t local_offset_full = tensor.offset + shard.offset;
+        ShardInfo shard  = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
+        ptrdiff_t local_offset_full    = tensor.offset + shard.offset;
         ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
 
-        // we only want to weight decay the 2D tensors and leave all 1D tensors alone
-        // in particular this also decays the embedding weights, but this is ok:
-        // - the token embeddings are weight shared and participate in the final projection to logits
-        // - the position embeddings actively participate at every forward/backward pass
         float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
-        floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
-        ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
-        float* m_ptr = model->m_memory + opt_state_offset;
-        float* v_ptr = model->v_memory + opt_state_offset;
+        ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ? local_offset_full : local_offset_partial;
+        float* m_ptr      = model->m_memory      + opt_state_offset;
+        float* v_ptr      = model->v_memory      + opt_state_offset;
         float* master_ptr = nullptr;
         if (model->master_weights != nullptr) { master_ptr = model->master_weights + opt_state_offset; }
-        if(init_state && model->master_weights != nullptr ) {
-            size_t grid_size = CEIL_DIV(shard.size, 512);
-            // First-touch initialization of the FP32 master copy from the low-precision weights.
-            // After this point, the optimizer treats master_weights as the authoritative values.
-            copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
-                                                                     shard.size, tensor.size);
-            cudaCheck(cudaGetLastError());
-        }
 
-        if (init_from_master_only) {
-            // when resuming training from a checkpoint with master weights (allows changing precision)
-            init_from_master(param_ptr, master_ptr, shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
+        if (!beast || !ptq_should_quantize_tensor(i)) {
+            // ----------------------------------------------------------------
+            // Non-quantized path (same as before): param_ptr is in params_memory.
+            // ----------------------------------------------------------------
+            floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
+            if (init_state && model->master_weights != nullptr) {
+                size_t grid_size = CEIL_DIV(shard.size, 512);
+                copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(
+                    master_ptr, param_ptr, shard.size, shard.size, tensor.size);
+                cudaCheck(cudaGetLastError());
+            }
+            if (init_from_master_only) {
+                init_from_master(param_ptr, master_ptr, shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
+            } else {
+                adamw_update(param_ptr, master_ptr, grad_ptr,
+                             m_ptr, v_ptr,
+                             shard.size, tensor.size, tensor.size, shard.size, num_layers,
+                             learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+            }
         } else {
-            // ok finally call the kernel to update the weights with AdamW
-            adamw_update(param_ptr, master_ptr, grad_ptr,
-                        m_ptr, v_ptr,
-                        shard.size, tensor.size, tensor.size, shard.size, num_layers,
-                        learning_rate,
-                        beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
-        }
+            // ----------------------------------------------------------------
+            // Beast-mode quantized path: tensor lives in ptq.tensors[i].
+            // Process one layer at a time, using scratch_dequant as floatX staging.
+            // ----------------------------------------------------------------
+            QuantizedTensor* qt = &model->ptq.tensors[i];
+            const size_t layer_elems = (size_t)qt->rows_per_layer * qt->cols; // elements per layer
+            // grad tensor offset for layer 0 of this tensor (grads_memory layout is same as original params_memory)
+            floatX* grad_base = (floatX*)model->grads_memory + tensor.offset;
 
-        if (multi_gpu_config->zero_stage == 1) {
+            for (int l = 0; l < num_layers; ++l) {
+                floatX* sd = model->scratch_dequant;
+                // Dequantize layer l's current quantized weights into sd (floatX)
+                ptq_dequantize_layer_slice(sd, qt, l, model->ptq_precision, main_stream);
+
+                float* layer_master_ptr = master_ptr ? master_ptr + l * (ptrdiff_t)layer_elems : nullptr;
+                floatX* layer_grad_ptr  = grad_base  + l * layer_elems;
+
+                if (init_state && layer_master_ptr != nullptr) {
+                    // First-touch: initialize FP32 master from the dequantized floatX
+                    size_t grid_size = CEIL_DIV(layer_elems, 512);
+                    copy_and_cast_kernel<<<grid_size, 512, 0, main_stream>>>(
+                        layer_master_ptr, sd, layer_elems, layer_elems, layer_elems);
+                    cudaCheck(cudaGetLastError());
+                }
+
+                if (!init_from_master_only) {
+                    // AdamW: sd is the param (for weight decay reads); master_ptr gets the FP32 update;
+                    // sd also receives the stochastic-rounded floatX output (we discard it below).
+                    adamw_update(sd, layer_master_ptr, layer_grad_ptr,
+                                 m_ptr + l * (ptrdiff_t)layer_elems,
+                                 v_ptr + l * (ptrdiff_t)layer_elems,
+                                 layer_elems, layer_elems, layer_elems, layer_elems, 1,
+                                 learning_rate, beta1, beta2, t, eps, wd, grad_scale,
+                                 seed + (unsigned int)l, main_stream);
+                    // Re-quantize from master_weights (FP32) → qvalues/scales.
+                    // This is more accurate than quantizing from the stochastic-rounded floatX in sd.
+                    const float* src = layer_master_ptr ? layer_master_ptr : nullptr;
+                    if (src != nullptr) {
+                        size_t scale_offset = (size_t)l * qt->rows_per_layer;
+                        size_t elem_offset  = (size_t)l * qt->rows_per_layer * qt->cols;
+                        ptq_quantize_rows_gpu_fp32(
+                            qt->qvalues + elem_offset,
+                            qt->scales  + scale_offset,
+                            model->row_maxes_scratch,
+                            src, qt->rows_per_layer, qt->cols,
+                            model->ptq_precision, main_stream);
+                    }
+                } else {
+                    // Checkpoint-resume: restore floatX param from master (for non-beast we'd use init_from_master)
+                    // For beast: dequantize the master back into qvalues/scales
+                    if (master_ptr != nullptr) {
+                        size_t scale_offset = (size_t)l * qt->rows_per_layer;
+                        size_t elem_offset  = (size_t)l * qt->rows_per_layer * qt->cols;
+                        ptq_quantize_rows_gpu_fp32(
+                            qt->qvalues + elem_offset,
+                            qt->scales  + scale_offset,
+                            model->row_maxes_scratch,
+                            layer_master_ptr, qt->rows_per_layer, qt->cols,
+                            model->ptq_precision, main_stream);
+                    }
+                }
+            }
+        }
+        // ZeRO-1 all-gather (single GPU: no-op)
+        if (multi_gpu_config->zero_stage == 1 && !beast) {
 #if MULTI_GPU
             ncclCheck(ncclGroupStart());
+            floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
             for(int l = 0; l < num_layers; ++l) {
-                // gather updated shards of model->params_memory from each process
                 ncclCheck(ncclAllGather(param_ptr + l * tensor.size,
                                         (floatX*) model->params_memory + tensor.offset + l * tensor.size,
                                         shard.size, ncclFloatX,
@@ -1506,13 +1914,12 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 #endif
         }
     }
-
-    if (model->ptq_enabled && model->ptq_precision != PTQ_PRECISION_NONE) {
-        gpt2_prepare_ptq(model);
-    }
+    // Beast mode: qvalues/scales are already up-to-date (updated per-layer above).
+    // Non-beast mode: nothing extra needed.
 
     cudaCheck(cudaDeviceSynchronize());
 }
+
 
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     /*
@@ -1545,6 +1952,8 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 
 void gpt2_free(GPT2 *model) {
     gpt2_clear_ptq(model);
+    cudaFreeCheck(&model->scratch_dequant);
+    cudaFreeCheck(&model->row_maxes_scratch);
     cudaFreeCheck(&model->params_memory);
     cudaFreeCheck(&model->grads_memory);
     cudaFreeCheck(&model->m_memory);
