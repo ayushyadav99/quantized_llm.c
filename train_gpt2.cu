@@ -4,6 +4,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <string>
 #include <string_view>
@@ -93,9 +94,156 @@ typedef struct {
     int channels; // number of channels, e.g. 768
 } GPT2Config;
 
+enum PTQPrecision {
+    PTQ_PRECISION_NONE = 0,
+    PTQ_PRECISION_INT8 = 1,
+    PTQ_PRECISION_FP8 = 2,
+};
+
+typedef struct {
+    uint8_t* qvalues;        // quantized payload for all layers, row-major
+    float* scales;           // one scale per output row
+    floatX* dequant_scratch; // one-layer temporary dequantized weight buffer
+    int num_layers;
+    int rows_per_layer;
+    int cols;
+    PTQPrecision precision;
+    bool initialized;
+} QuantizedFCW;
+
+constexpr float FP8_E4M3_MAX = 448.0f;
+
+const char* ptq_precision_to_string(PTQPrecision precision) {
+    switch (precision) {
+        case PTQ_PRECISION_INT8: return "int8";
+        case PTQ_PRECISION_FP8: return "fp8";
+        default: return "none";
+    }
+}
+
+PTQPrecision ptq_precision_from_string(const char* value) {
+    if (strcmp(value, "none") == 0) { return PTQ_PRECISION_NONE; }
+    if (strcmp(value, "int8") == 0) { return PTQ_PRECISION_INT8; }
+    if (strcmp(value, "fp8") == 0) { return PTQ_PRECISION_FP8; }
+    fprintf(stderr, "Unsupported PTQ precision '%s'. Expected one of: int8, fp8.\n", value);
+    exit(EXIT_FAILURE);
+}
+
+__host__ __device__ inline float ptq_decode_fp8_e4m3(uint8_t raw) {
+    const float sign = (raw & 0x80) ? -1.0f : 1.0f;
+    const int exponent = (raw >> 3) & 0x0F;
+    const int mantissa = raw & 0x07;
+    if (exponent == 0) {
+        if (mantissa == 0) { return copysignf(0.0f, sign); }
+        return sign * ((float)mantissa / 512.0f);
+    }
+    if (exponent == 0x0F) {
+        return sign * FP8_E4M3_MAX;
+    }
+    return sign * ldexpf(1.0f + (float)mantissa / 8.0f, exponent - 7);
+}
+
+uint8_t ptq_encode_fp8_e4m3(float value) {
+    if (value == 0.0f) {
+        return signbit(value) ? 0x80 : 0x00;
+    }
+
+    const uint8_t sign = signbit(value) ? 0x80 : 0x00;
+    float abs_value = fabsf(value);
+    abs_value = fminf(abs_value, FP8_E4M3_MAX);
+
+    if (abs_value < (1.0f / 512.0f)) {
+        return sign;
+    }
+
+    if (abs_value < 0.015625f) {
+        int mantissa = (int)lrintf(abs_value * 512.0f);
+        mantissa = max(1, min(7, mantissa));
+        return sign | (uint8_t)mantissa;
+    }
+
+    int exponent = 0;
+    float normalized = frexpf(abs_value, &exponent); // abs_value = normalized * 2^exponent, normalized in [0.5, 1)
+    normalized *= 2.0f;
+    exponent -= 1;
+    int exponent_field = exponent + 7;
+    int mantissa = (int)lrintf((normalized - 1.0f) * 8.0f);
+    if (mantissa == 8) {
+        mantissa = 0;
+        exponent_field += 1;
+    }
+    if (exponent_field >= 0x0F) {
+        exponent_field = 0x0E;
+        mantissa = 0x07;
+    }
+    exponent_field = max(1, exponent_field);
+    return sign | (uint8_t)(exponent_field << 3) | (uint8_t)mantissa;
+}
+
+void ptq_quantize_rows_host(uint8_t* dst, float* scales, const float* src, int rows, int cols, PTQPrecision precision) {
+    assert(precision == PTQ_PRECISION_INT8 || precision == PTQ_PRECISION_FP8);
+    const float quant_max = precision == PTQ_PRECISION_INT8 ? 127.0f : FP8_E4M3_MAX;
+    for (int row = 0; row < rows; ++row) {
+        const float* row_src = src + row * cols;
+        uint8_t* row_dst = dst + row * cols;
+        float max_abs = 0.0f;
+        for (int col = 0; col < cols; ++col) {
+            max_abs = fmaxf(max_abs, fabsf(row_src[col]));
+        }
+        float scale = max_abs > 0.0f ? max_abs / quant_max : 1.0f;
+        scales[row] = scale;
+        for (int col = 0; col < cols; ++col) {
+            const float scaled = row_src[col] / scale;
+            if (precision == PTQ_PRECISION_INT8) {
+                const int q = (int)lrintf(fmaxf(-127.0f, fminf(127.0f, scaled)));
+                row_dst[col] = (uint8_t)((int8_t)q);
+            } else {
+                row_dst[col] = ptq_encode_fp8_e4m3(scaled);
+            }
+        }
+    }
+}
+
+void ptq_dequantize_rows_host(float* dst, const uint8_t* src, const float* scales, int rows, int cols, PTQPrecision precision) {
+    assert(precision == PTQ_PRECISION_INT8 || precision == PTQ_PRECISION_FP8);
+    for (int row = 0; row < rows; ++row) {
+        const float scale = scales[row];
+        for (int col = 0; col < cols; ++col) {
+            const uint8_t raw = src[row * cols + col];
+            const float q = precision == PTQ_PRECISION_INT8 ? (float)((int8_t)raw) : ptq_decode_fp8_e4m3(raw);
+            dst[row * cols + col] = scale * q;
+        }
+    }
+}
+
+__global__ void ptq_dequantize_rows_kernel(floatX* dst, const uint8_t* src, const float* scales,
+                                           int rows, int cols, PTQPrecision precision) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int count = rows * cols;
+    if (idx >= count) { return; }
+    const int row = idx / cols;
+    const uint8_t raw = src[idx];
+    const float q = precision == PTQ_PRECISION_INT8 ? (float)((int8_t)raw) : ptq_decode_fp8_e4m3(raw);
+    dst[idx] = (floatX)(scales[row] * q);
+}
+
+void ptq_dequantize_rows(floatX* dst, const uint8_t* src, const float* scales, int rows, int cols,
+                         PTQPrecision precision, cudaStream_t stream) {
+    const int count = rows * cols;
+    const int block_size = 256;
+    const int grid_size = CEIL_DIV(count, block_size);
+    ptq_dequantize_rows_kernel<<<grid_size, block_size, 0, stream>>>(dst, src, scales, rows, cols, precision);
+    cudaCheck(cudaGetLastError());
+}
+
 // the parameters of the model
 constexpr const int NUM_PARAMETER_TENSORS = 16;
 typedef struct {
+    // All learnable weights are stored in floatX on device:
+    // - FP32 build: float
+    // - BF16 build: __nv_bfloat16
+    // - FP16 build: half (not fully wired up for checkpoint loading yet)
+    // Precision-sensitive math often still accumulates in FP32 later.
     floatX* wte; // (V, C)
     floatX* wpe; // (maxT, C)
     floatX* ln1w; // (L, C)
@@ -169,6 +317,9 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
 
 constexpr int NUM_ACTIVATION_TENSORS = 21;
 typedef struct {
+    // Activations that participate in the main model dataflow are stored in floatX.
+    // Statistics that need extra numeric stability (layernorm mean/rstd, losses, some
+    // cuDNN attention metadata) stay in FP32 even in BF16 mode.
     floatX* encoded; // (B, T, C)
     floatX* ln1; // (L, B, T, C)
     float* ln1_mean; // (L, B, T)
@@ -294,10 +445,11 @@ typedef struct {
     // gradients of the weights
     ParameterTensors grads;
     void* grads_memory;
-    // buffers for the AdamW optimizer
+    // AdamW moments always stay in FP32. This is one half of the "mixed precision"
+    // story here: forward/backward mostly use floatX, optimizer state stays float.
     float* m_memory;
     float* v_memory;
-    float* master_weights;     // is NULL unless fp32 weights is enabled.
+    float* master_weights;     // optional FP32 copy of params used for numerically safer updates
     // the activations of the model, and their sizes
     ActivationTensors acts;
     TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];
@@ -310,16 +462,31 @@ typedef struct {
     float mean_loss; // after the last backward micro-batch, will be populated with mean loss across all GPUs and micro-steps
     float* accumulated_mean_loss; // GPU buffer used to accumulate loss across micro-steps
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
-    unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
-    unsigned long long rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
-    int use_master_weights; // keep master weights copy in float for optim update? 0|1
+    unsigned long long rng_state; // RNG state used by stochastic rounding and other kernels
+    unsigned long long rng_state_last_update; // saved so checkpoint restore can reproduce the same low-precision rounding
+    int use_master_weights; // keep a FP32 master copy for the optimizer/update path? 0|1
     bool init_state;   // set to true if master weights need to be initialized
     int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
+    // inference-only PTQ v1: only fcw is quantized, dequantized on demand before GEMM
+    int ptq_enabled;
+    PTQPrecision ptq_precision;
+    QuantizedFCW ptq_fcw;
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
+
+void gpt2_clear_ptq(GPT2 *model) {
+    cudaFreeCheck(&model->ptq_fcw.qvalues);
+    cudaFreeCheck(&model->ptq_fcw.scales);
+    cudaFreeCheck(&model->ptq_fcw.dequant_scratch);
+    model->ptq_fcw.rows_per_layer = 0;
+    model->ptq_fcw.cols = 0;
+    model->ptq_fcw.num_layers = 0;
+    model->ptq_fcw.precision = PTQ_PRECISION_NONE;
+    model->ptq_fcw.initialized = false;
+}
 
 void gpt2_init_common(GPT2 *model) {
     // common inits outside of the model weights
@@ -344,10 +511,66 @@ void gpt2_init_common(GPT2 *model) {
     model->master_weights = NULL;
     // other default settings
     model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
+    // In BF16 mode this is the important safeguard: update the FP32 master copy,
+    // then re-round back down into floatX for the next forward pass.
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    model->ptq_enabled = 0;
+    model->ptq_precision = PTQ_PRECISION_NONE;
+    model->ptq_fcw = {};
+}
+
+void gpt2_prepare_ptq(GPT2 *model) {
+    if (!model->ptq_enabled || model->ptq_precision == PTQ_PRECISION_NONE) {
+        gpt2_clear_ptq(model);
+        return;
+    }
+    if (model->ptq_precision != PTQ_PRECISION_INT8 && model->ptq_precision != PTQ_PRECISION_FP8) {
+        fprintf(stderr, "PTQ precision '%s' is not supported.\n", ptq_precision_to_string(model->ptq_precision));
+        exit(EXIT_FAILURE);
+    }
+    if (model->params_memory == nullptr) {
+        fprintf(stderr, "PTQ requires model weights to be initialized first.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    gpt2_clear_ptq(model);
+
+    const int rows_per_layer = 4 * model->config.channels;
+    const int cols = model->config.channels;
+    const int num_layers = model->config.num_layers;
+    const size_t total_rows = (size_t)rows_per_layer * num_layers;
+    const size_t total_elements = total_rows * cols;
+
+    floatX* fcw_host_raw = (floatX*)mallocCheck(total_elements * sizeof(floatX));
+    float* fcw_host = (float*)mallocCheck(total_elements * sizeof(float));
+    uint8_t* qvalues_host = (uint8_t*)mallocCheck(total_elements * sizeof(uint8_t));
+    float* scales_host = (float*)mallocCheck(total_rows * sizeof(float));
+
+    cudaCheck(cudaMemcpy(fcw_host_raw, model->params.fcw, total_elements * sizeof(floatX), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < total_elements; ++i) {
+        fcw_host[i] = (float)fcw_host_raw[i];
+    }
+    ptq_quantize_rows_host(qvalues_host, scales_host, fcw_host, (int)total_rows, cols, model->ptq_precision);
+
+    cudaCheck(cudaMalloc((void**)&model->ptq_fcw.qvalues, total_elements * sizeof(uint8_t)));
+    cudaCheck(cudaMalloc((void**)&model->ptq_fcw.scales, total_rows * sizeof(float)));
+    cudaCheck(cudaMalloc((void**)&model->ptq_fcw.dequant_scratch, (size_t)rows_per_layer * cols * sizeof(floatX)));
+    cudaCheck(cudaMemcpy(model->ptq_fcw.qvalues, qvalues_host, total_elements * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(model->ptq_fcw.scales, scales_host, total_rows * sizeof(float), cudaMemcpyHostToDevice));
+
+    model->ptq_fcw.rows_per_layer = rows_per_layer;
+    model->ptq_fcw.cols = cols;
+    model->ptq_fcw.num_layers = num_layers;
+    model->ptq_fcw.precision = model->ptq_precision;
+    model->ptq_fcw.initialized = true;
+
+    free(fcw_host_raw);
+    free(fcw_host);
+    free(qvalues_host);
+    free(scales_host);
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -392,8 +615,9 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     // and returns a status code of 1 if it had to fall back, in that case we want to print warning.
     int memory_status = 0;
 
-    // we will now init the optimizer states and master weights
-    // this is usually a substantial amount of memory allocation right here.
+    // We allocate optimizer state after weights because optimizer memory is always FP32,
+    // regardless of whether params/grads are stored as BF16 or FP32.
+    // This is where most of the training-time "mixed precision" memory split is set up.
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters; // num parameters we are responsible for
     printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
     printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
@@ -479,7 +703,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
         exit(EXIT_FAILURE);
     }
 
-    // check if the precision mode of the checkpoing matches the model precision
+    // The stored checkpoint precision must match the build precision because params_memory
+    // is allocated as raw floatX and then filled directly from file bytes.
+    // There is no generic on-load cast here except through the separate master-weight restore path.
     if (weight_init) {
         if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
             fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
@@ -674,7 +900,12 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // we can do this while the copies are already underway
     tokenCheck(inputs, B*T, V);
 
-    // forward pass
+    // Forward pass overview:
+    // 1) embeddings / residual stream are floatX
+    // 2) GEMMs run through cuBLASLt using floatX inputs/outputs but FP32 compute accumulation
+    //    (see cublas_compute in common_start and llmc/matmul.cuh)
+    // 3) numerically sensitive reductions/statistics (layernorm mean/rstd, losses) stay float
+    // There is no AMP/autocast framework here; precision is selected at compile time.
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
@@ -713,8 +944,19 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
+        if (model->ptq_enabled && model->ptq_fcw.initialized) {
+            const size_t offset = (size_t)l * model->ptq_fcw.rows_per_layer * model->ptq_fcw.cols;
+            ptq_dequantize_rows(model->ptq_fcw.dequant_scratch,
+                                model->ptq_fcw.qvalues + offset,
+                                model->ptq_fcw.scales + (size_t)l * model->ptq_fcw.rows_per_layer,
+                                model->ptq_fcw.rows_per_layer, model->ptq_fcw.cols,
+                                model->ptq_fcw.precision, main_stream);
+            l_fcw = model->ptq_fcw.dequant_scratch;
+        }
 
-        // now do the forward pass
+        // Attention/MLP weights and activations are floatX, but the heavy GEMMs are still
+        // accumulated by cuBLASLt in FP32. For quantization work, these matmul call sites
+        // are the most important seams to intercept/replace.
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
@@ -750,6 +992,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
     }
 
+    // Final logits are written in floatX as well. The fused classifier kernel later reads
+    // them and internally promotes as needed for softmax / cross-entropy math.
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -821,7 +1065,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     tokenCheck(targets, B*T, V);
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
 
-    // backward pass: go in the reverse order of the forward pass, and call backward() functions
+    // Backward pass mirrors forward. Gradients for learnable tensors are stored in floatX,
+    // not FP32, so this code relies on BF16 being stable enough in practice plus FP32 Adam
+    // moments/master weights on the update side. There is no gradient scaler here.
 
     // reset residual stream gradients (put here to work with gradient accumulation)
     floatX* dresidual = (floatX*)model->acts.scratch_btc; // the main buffer holding the gradient in the backward pass
@@ -1057,7 +1303,12 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
     model->rng_state_last_update = model->rng_state;
 
-    // AdamW update
+    // AdamW update precision story:
+    // - read gradient from floatX and promote to float
+    // - update m and v in float
+    // - update parameter in float, preferably from master_weights
+    // - stochastic-round the new value back into floatX for the next forward pass
+    // This is the other half of the current mixed-precision design.
     // handle adamw for all the transformer blocks
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         // generate a unique seed for each tensor
@@ -1088,6 +1339,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         if (model->master_weights != nullptr) { master_ptr = model->master_weights + opt_state_offset; }
         if(init_state && model->master_weights != nullptr ) {
             size_t grid_size = CEIL_DIV(shard.size, 512);
+            // First-touch initialization of the FP32 master copy from the low-precision weights.
+            // After this point, the optimizer treats master_weights as the authoritative values.
             copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
                                                                      shard.size, tensor.size);
             cudaCheck(cudaGetLastError());
@@ -1153,6 +1406,7 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 }
 
 void gpt2_free(GPT2 *model) {
+    gpt2_clear_ptq(model);
     cudaFreeCheck(&model->params_memory);
     cudaFreeCheck(&model->grads_memory);
     cudaFreeCheck(&model->m_memory);
@@ -1187,7 +1441,8 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
-    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
+    // In FP32 builds we may still run GEMMs in TF32 on Ampere/Hopper for throughput.
+    // That is separate from BF16 storage: TF32 only changes how FP32 matmuls are executed.
     bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8 && override_enable_tf32;
     cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
@@ -1281,7 +1536,8 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     if(model->use_master_weights) {
         assert(model->master_weights != nullptr);
         file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-        // restore weights from the master weights using the RNG state before last weight update
+        // restore weights from the FP32 master weights using the RNG state before last update
+        // so the low-precision params are re-rounded identically to the original run.
         model->rng_state = model->rng_state_last_update;
         gpt2_update(model, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, &multi_gpu_config, /* init_from_master_only*/ true);
         model->rng_state = *((unsigned long long*)&state_header[20]); // use final RNG state from checkpoint after this
@@ -1404,6 +1660,8 @@ void error_usage() {
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    fprintf(stderr, "  --ptq <0|1>           enable inference-only PTQ for fcw (default = 0)\n");
+    fprintf(stderr, "  --ptq_precision <str> PTQ precision for fcw: int8|fp8 (default = int8)\n");
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
     fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
@@ -1449,6 +1707,8 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    int ptq_enabled = 0;
+    const char* ptq_precision_name = "int8";
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1458,6 +1718,8 @@ int main(int argc, char *argv[]) {
     char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
+        if (strcmp(argv[i], "--ptq") == 0) { ptq_enabled = atoi(argv[i+1]); continue; }
+        if (strcmp(argv[i], "--ptq_precision") == 0) { ptq_precision_name = argv[i+1]; continue; }
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
         // read in the args
@@ -1547,6 +1809,8 @@ int main(int argc, char *argv[]) {
     printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
     printf0("| gelu_fusion           | %-50d |\n", gelu_fusion);
     printf0("| recompute             | %-50d |\n", recompute);
+    printf0("| ptq enabled           | %-50s |\n", ptq_enabled ? "yes" : "no");
+    printf0("| ptq precision         | %-50s |\n", ptq_enabled ? ptq_precision_name : "n/a");
     printf0("+-----------------------+----------------------------------------------------+\n");
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
@@ -1588,6 +1852,9 @@ int main(int argc, char *argv[]) {
     model.use_master_weights = use_master_weights;
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
+    model.ptq_enabled = ptq_enabled;
+    model.ptq_precision = ptq_enabled ? ptq_precision_from_string(ptq_precision_name) : PTQ_PRECISION_NONE;
+    gpt2_prepare_ptq(&model);
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
@@ -1622,6 +1889,15 @@ int main(int argc, char *argv[]) {
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
     printf0("+-----------------------+----------------------------------------------------+\n");
+    if (model.ptq_enabled && resuming == 1) {
+        fprintf(stderr, "PTQ v1 does not support resumed runs. Start from a model checkpoint and use `-x 0`.\n");
+        exit(EXIT_FAILURE);
+    }
+    if (model.ptq_enabled && train_num_batches > 0) {
+        fprintf(stderr, "PTQ v1 is inference-only. Re-run with `-x 0 --ptq 1 --ptq_precision %s`.\n",
+                ptq_precision_to_string(model.ptq_precision));
+        exit(EXIT_FAILURE);
+    }
 
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;

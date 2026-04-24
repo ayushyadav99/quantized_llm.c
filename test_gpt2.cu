@@ -88,6 +88,82 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
     return params_memory;
 }
 
+int check_ptq_roundtrip(PTQPrecision precision, float max_abs_threshold, float max_rel_threshold) {
+    const int rows = 2;
+    const int cols = 8;
+    const float source[rows * cols] = {
+        -1.25f, -0.75f, -0.125f, -0.03125f, 0.0f, 0.0625f, 0.5f, 1.0f,
+         0.001f, -0.002f, 0.01f, -0.02f, 0.25f, -0.5f, 3.0f, -6.0f,
+    };
+    uint8_t quantized[rows * cols];
+    float scales[rows];
+    float restored[rows * cols];
+    ptq_quantize_rows_host(quantized, scales, source, rows, cols, precision);
+    ptq_dequantize_rows_host(restored, quantized, scales, rows, cols, precision);
+
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    for (int i = 0; i < rows * cols; ++i) {
+        const float abs_diff = fabsf(source[i] - restored[i]);
+        const float rel_diff = fabsf(source[i]) > 1e-8f ? abs_diff / fabsf(source[i]) : abs_diff;
+        max_abs = fmaxf(max_abs, abs_diff);
+        max_rel = fmaxf(max_rel, rel_diff);
+    }
+    const int ok = max_abs <= max_abs_threshold && max_rel <= max_rel_threshold;
+    printf("PTQ %s roundtrip: max_abs=%f max_rel=%f => %s\n",
+           ptq_precision_to_string(precision), max_abs, max_rel, ok ? "OK" : "NOT OK");
+    return ok;
+}
+
+int check_ptq_forward_regression(GPT2* model, const int* x, const int* y, int B, int T,
+                                 const float* baseline_logits, int V, int Vp) {
+    struct RegressionConfig {
+        PTQPrecision precision;
+        float max_logit_diff;
+        float max_loss_diff;
+    };
+    const RegressionConfig configs[] = {
+        {PTQ_PRECISION_INT8, 0.75f, 0.05f},
+        {PTQ_PRECISION_FP8,  1.50f, 0.15f},
+    };
+
+    int ok = 1;
+    float baseline_loss = gpt2_validate(model, x, y, B, T);
+    floatX* logits_raw = (floatX*)mallocCheck(B * T * Vp * sizeof(floatX));
+    float* logits = (float*)mallocCheck(B * T * Vp * sizeof(float));
+
+    for (RegressionConfig config : configs) {
+        model->ptq_enabled = 1;
+        model->ptq_precision = config.precision;
+        gpt2_prepare_ptq(model);
+        gpt2_forward(model, x, B, T);
+        cudaCheck(cudaMemcpy(logits_raw, model->acts.output, B * T * Vp * sizeof(floatX), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < B * T * Vp; ++i) {
+            logits[i] = (float)logits_raw[i];
+        }
+        float max_logit_diff = 0.0f;
+        for (int bt = 0; bt < B * T; ++bt) {
+            for (int v = 0; v < V; ++v) {
+                const float diff = fabsf(baseline_logits[bt * Vp + v] - logits[bt * Vp + v]);
+                max_logit_diff = fmaxf(max_logit_diff, diff);
+            }
+        }
+        float ptq_loss = gpt2_validate(model, x, y, B, T);
+        float loss_diff = fabsf(ptq_loss - baseline_loss);
+        const int config_ok = max_logit_diff <= config.max_logit_diff && loss_diff <= config.max_loss_diff;
+        printf("PTQ %s forward regression: max_logit_diff=%f loss_diff=%f => %s\n",
+               ptq_precision_to_string(config.precision), max_logit_diff, loss_diff, config_ok ? "OK" : "NOT OK");
+        ok &= config_ok;
+        gpt2_clear_ptq(model);
+        model->ptq_enabled = 0;
+        model->ptq_precision = PTQ_PRECISION_NONE;
+    }
+
+    free(logits_raw);
+    free(logits);
+    return ok;
+}
+
 int main(int argc, char *argv[]) {
     char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
     int num_processes = -1;  // doesn't matter when using MPI
@@ -212,6 +288,10 @@ int main(int argc, char *argv[]) {
     if(!logits_ok) { printf("NOT "); }
     printf("OK (LOGITS)\n");
     printf("logit max diff: %f\n", max_diff);
+
+    allok &= check_ptq_roundtrip(PTQ_PRECISION_INT8, 0.03f, 0.20f);
+    allok &= check_ptq_roundtrip(PTQ_PRECISION_FP8, 0.20f, 0.60f);
+    allok &= check_ptq_forward_regression(&model, x, y, B, T, logits_cpu, V, Vp);
 
     // let's do 10 training iterations, following the pytorch code
     float losses[10];
