@@ -4,11 +4,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef USE_NVML
 #if __has_include(<nvml.h>)
 #define USE_NVML 1
 #include <nvml.h>
 #else
 #define USE_NVML 0
+#endif
 #endif
 
 // tied to enum PrecisionMode, in a future refactor make them the same
