@@ -143,7 +143,7 @@ __host__ __device__ inline float ptq_decode_fp8_e4m3(uint8_t raw) {
     return sign * ldexpf(1.0f + (float)mantissa / 8.0f, exponent - 7);
 }
 
-uint8_t ptq_encode_fp8_e4m3(float value) {
+__host__ __device__ uint8_t ptq_encode_fp8_e4m3(float value) {
     if (value == 0.0f) {
         return signbit(value) ? 0x80 : 0x00;
     }
@@ -1119,6 +1119,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
             // Unquantized tensors → loaded as floatX into params.* slots.
             // Quantized tensors   → loaded as (qvalues uint8, scales float) into ptq.tensors[i].
             PTQPrecision ckpt_prec = (PTQPrecision)model_header[8];
+            (void)ckpt_prec; // reserved for future format validation
             floatX** ptrs[NUM_PARAMETER_TENSORS];
             get_parameter_tensor_ptrs(&model->params, ptrs);
             for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
