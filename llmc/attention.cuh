@@ -27,9 +27,9 @@ __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
     int n = rest / d;
     int d_ = rest % d;
     int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-    q[idx] = __ldcs(&inp[inp_idx]);
-    k[idx] = __ldcs(&inp[inp_idx + NH * d]);
-    v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
+    q[idx] = load_streaming(&inp[inp_idx]);
+    k[idx] = load_streaming(&inp[inp_idx + NH * d]);
+    v[idx] = load_streaming(&inp[inp_idx + 2 * (NH * d)]);
 }
 
 __global__ void permute_kernel_backward(floatX* dinp,
@@ -65,7 +65,7 @@ __global__ void unpermute_kernel(floatX* inp, floatX *out, int B, int N, int NH,
     int n = rest / d;
     int d_ = rest % d;
     int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-    out[other_idx] = __ldcs(&inp[idx]);
+    out[other_idx] = load_streaming(&inp[idx]);
 }
 
 __global__ void unpermute_kernel_backward(floatX* dinp, const floatX *dout, int B, int N, int NH, int d) {
@@ -144,8 +144,8 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     // divide the whole row by the sum
     for (int i = lane_id; i <= own_pos; i += WARP_SIZE) {
         // recalculation is faster than doing the round-trip through memory.
-        float ev = expf(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
-        __stcs(out + idx * T + i, (floatX)(ev * norm));
+        float ev = expf(inv_temperature * ((float)load_streaming(x + i) - global_maxval));
+        store_streaming(out + idx * T + i, (floatX)(ev * norm));
     }
 }
 
@@ -179,11 +179,11 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
             // don't touch the cache. Some parts will still be here from the previous loop, and
             // we want to exploit those.
             if(t3 <= t) {
-                float acc = (float) __ldcs(att_bth + t3) * ((float) __ldcs(datt_bth + t3) - local_sum);
-                __stcs(dpreatt_bth + t3, (floatX) (scale * acc));
+                float acc = (float) load_streaming(att_bth + t3) * ((float) load_streaming(datt_bth + t3) - local_sum);
+                store_streaming(dpreatt_bth + t3, (floatX) (scale * acc));
             } else {
                 // explicitly set non-causal elements to zero
-                __stcs(dpreatt_bth + t3, (floatX)0.f);
+                store_streaming(dpreatt_bth + t3, (floatX)0.f);
             }
         }
     }

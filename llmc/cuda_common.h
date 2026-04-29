@@ -93,18 +93,24 @@ typedef __nv_bfloat16 floatX;
 
 // ----------------------------------------------------------------------------
 // Load and store with streaming cache hints
-// Older nvcc does not provide __ldcs and __stcs for bfloat16, despite these
-// actually just being unsigned shorts. We need to be careful here to only define
-// our own versions if none already exist, otherwise the compiler will complain.
-// If not, you easily get "no viable overload" (for sm52) and "function already exists" (sm_80)
 
-#if defined(ENABLE_BF16) && (__CUDACC_VER_MAJOR__ < 12) && !((__CUDA_ARCH__ >= 800) || !defined(__CUDA_ARCH__))
-__device__ floatX __ldcs(const floatX* address) {
-    unsigned short bf = __ldcs(reinterpret_cast<const unsigned short*>(address));
-    return __nv_bfloat16_raw{bf};
+template <typename T>
+__device__ inline T load_streaming(const T* address) {
+    return __ldcs(address);
 }
 
-__device__ void __stcs(floatX* address, floatX value) {
+template <typename T>
+__device__ inline void store_streaming(T* address, T value) {
+    __stcs(address, value);
+}
+
+#if defined(ENABLE_BF16)
+__device__ inline __nv_bfloat16 load_streaming(const __nv_bfloat16* address) {
+    unsigned short raw = __ldcs(reinterpret_cast<const unsigned short*>(address));
+    return __nv_bfloat16_raw{raw};
+}
+
+__device__ inline void store_streaming(__nv_bfloat16* address, __nv_bfloat16 value) {
     __stcs(reinterpret_cast<unsigned short*>(address), ((__nv_bfloat16_raw)value).x);
 }
 #endif
