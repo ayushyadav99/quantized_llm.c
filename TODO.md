@@ -1,33 +1,21 @@
-# Quantization Roadmap: Extreme Memory Efficiency
+# Quantization TODO List
 
-This document outlines the next steps for pushing the `quantized_llm.c` project beyond "Beast-mode PTQ" into a fully quantized training and inference regime.
+1. **Remove master weights**
+   - Currently, `use_master_weights = 1` maintains a full FP32 copy for updates.
+   - *Task:* Perform updates directly on `floatX` (BF16/FP16) or quantized weights to save 4 bytes per parameter.
 
-## Phase 1: Parameter & Weight Optimization
-- [ ] **Remove FP32 Master Weights**
-  - Currently, `use_master_weights = 1` maintains a full FP32 copy for updates.
-  - *Goal:* Perform updates directly on `floatX` (BF16/FP16) or quantized weights to save 4 bytes per parameter.
-- [ ] **Quantize Embedding Weights (`wte` & `wpe`)**
-  - Currently excluded in `ptq_should_quantize_tensor` due to random-access lookup patterns.
-  - *Goal:* Implement INT8 quantization for embeddings and update `encoder_forward` to handle dequantization.
+2. **Change embedding weights to INT8**
+   - Currently excluded in `ptq_should_quantize_tensor` due to random-access lookup patterns.
+   - *Task:* Implement INT8 quantization for `wte` and `wpe` and update `encoder_forward` to handle dequantization.
 
-## Phase 2: Optimizer State Compression
-- [ ] **8-bit Optimizer States**
-  - Currently, AdamW moments ($m$ and $v$) are stored in FP32.
-  - *Goal:* Change optimizer buffers to INT8/FP8 with dynamic scaling to reduce optimizer memory overhead by 75%.
-- [ ] **Stochastic Rounding for Updates**
-  - Ensure that updates to low-precision weights don't "vanish" by implementing stochastic rounding.
+3. **Make it type agnostic and see if code is correct**
+   - Refactor the codebase to support arbitrary precision modes (FP32, BF16, FP16, FP8, INT8).
+   - *Task:* Ensure switching precision doesn't require logic changes and verify loss convergence against FP32 baselines.
 
-## Phase 3: Activation & Flow Quantization
-- [ ] **Quantize Activations**
-  - Currently, activations like `ln1`, `atty`, and `fch` are stored in `floatX`.
-  - *Goal:* Implement INT8/FP8 quantization for all intermediate activations to significantly reduce VRAM usage during the backward pass.
-- [ ] **Fused Quantization Kernels**
-  - Merge quantization/dequantization steps into existing kernels (e.g., fused LayerNorm + Quantize) to minimize memory bandwidth overhead.
+4. **Change the optimizer states to INT8/FP8**
+   - AdamW moments ($m$ and $v$) are currently stored in FP32.
+   - *Task:* Compress optimizer buffers to 8-bit with dynamic scaling to reduce VRAM overhead by 75%.
 
-## Phase 4: Architectural Improvements
-- [ ] **Type-Agnostic Core**
-  - Refactor the codebase to support arbitrary precision modes via template parameters or dynamic dispatch.
-  - *Goal:* Easily switch between FP32, BF16, FP16, FP8, and INT8 without modifying core logic.
-- [ ] **Validation & Correctness Suite**
-  - Implement a rigorous verification script to compare low-precision training stability against FP32 baselines.
-  - Monitor loss divergence and gradient flow health.
+5. **Change the Activations to INT8/FP8**
+   - Activations (e.g., `ln1`, `atty`, `fch`) are currently stored in `floatX`.
+   - *Task:* Implement quantization for intermediate activations to save memory during the backward pass.
