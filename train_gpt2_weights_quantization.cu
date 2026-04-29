@@ -589,14 +589,44 @@ void gpt2_load_free(GPT2Load *load) {
     }
 }
 
-// Cast every weight tensor from floatLOAD (load_model) into floatX (model).
-// model->params_memory must already be allocated (via gpt2_allocate_weights) before calling this.
+// Cast every weight tensor from floatLOAD (load_model) directly into floatX (model).
 // Activations and optimizer states are left completely untouched.
 void gpt2_quantize_loaded_model(GPT2 *model, GPT2Load *load_model) {
     assert(model->params_memory != nullptr && "call gpt2_allocate_weights before gpt2_quantize_loaded_model");
     assert(load_model->params_memory != nullptr);
 
-    // Collect (dst floatX*, src floatLOAD*, element_count) for all 16 tensors.
+    const size_t Vp   = model->config.padded_vocab_size;
+    const size_t C    = model->config.channels;
+    const size_t maxT = model->config.max_seq_len;
+    const size_t L    = model->config.num_layers;
+
+    // rows for each tensor: weight matrices use per-output-channel rows,
+    // bias/norm vectors use one row per layer (or 1 for global norms).
+    const size_t rows[NUM_PARAMETER_TENSORS] = {
+        Vp,        // wte      (Vp, C)
+        maxT,      // wpe      (maxT, C)
+        L,         // ln1w     (L, C)
+        L,         // ln1b     (L, C)
+        L * 3 * C, // qkvw     (L, 3C, C)
+        L,         // qkvb     (L, 3C)
+        L * C,     // attprojw (L, C, C)
+        L,         // attprojb (L, C)
+        L,         // ln2w     (L, C)
+        L,         // ln2b     (L, C)
+        L * 4 * C, // fcw      (L, 4C, C)
+        L,         // fcb      (L, 4C)
+        L * C,     // fcprojw  (L, C, 4C)
+        L,         // fcprojb  (L, C)
+        1,         // lnfw     (C,)
+        1,         // lnfb     (C,)
+    };
+
+    // allocate a single scales scratch buffer sized to the widest tensor
+    size_t max_rows = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) { max_rows = max(max_rows, rows[i]); }
+    float* scales_buf;
+    cudaCheck(cudaMalloc((void**)&scales_buf, max_rows * sizeof(float)));
+
     floatX*    dsts[NUM_PARAMETER_TENSORS];
     floatLOAD* srcs[NUM_PARAMETER_TENSORS];
     dsts[0]  = model->params.wte;       srcs[0]  = load_model->params.wte;
@@ -616,16 +646,14 @@ void gpt2_quantize_loaded_model(GPT2 *model, GPT2Load *load_model) {
     dsts[14] = model->params.lnfw;      srcs[14] = load_model->params.lnfw;
     dsts[15] = model->params.lnfb;      srcs[15] = load_model->params.lnfb;
 
-    const int block = 256;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        size_t n = model->param_elements[i];
-        if (n == 0) { continue; }
-        int grid = CEIL_DIV(n, block);
-        copy_and_cast_kernel<<<grid, block, 0, main_stream>>>(dsts[i], srcs[i], n, 0, 0);
-        cudaCheck(cudaGetLastError());
+        if (model->param_elements[i] == 0) { continue; }
+        int cols = (int)(model->param_elements[i] / rows[i]);
+        quantize_loaded_weights(dsts[i], scales_buf, srcs[i], (int)rows[i], cols, main_stream);
     }
+    cudaCheck(cudaFree(scales_buf));
     cudaCheck(cudaDeviceSynchronize());
-    printf0("Quantized %zu parameters from floatLOAD -> floatX\n", model->num_parameters);
+    printf0("Quantized %zu parameters from floatLOAD -> floatX (per-row scaling)\n", model->num_parameters);
 }
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool weight_init=true, bool quantize=true) {
@@ -1602,7 +1630,7 @@ int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* load_filename = "gpt2_124M.bin"; // bf16 weights of the model
+    const char* load_filename = "gpt2_124M.bin";
     const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write checkpoints every how many steps?

@@ -139,6 +139,34 @@ __device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
     return __bfloat162float(val);
 }
 
+// Specializations with half (fp16) as the destination.
+template<>
+__device__ half cast_value<half, half>(half val) {
+    return val;
+}
+template<>
+__device__ half cast_value<half, float>(float val) {
+    return __float2half(val);
+}
+template<>
+__device__ half cast_value<half, __nv_bfloat16>(__nv_bfloat16 val) {
+    return __float2half(__bfloat162float(val));
+}
+
+// Specializations with bfloat16 as the destination.
+template<>
+__device__ __nv_bfloat16 cast_value<__nv_bfloat16, __nv_bfloat16>(__nv_bfloat16 val) {
+    return val;
+}
+template<>
+__device__ __nv_bfloat16 cast_value<__nv_bfloat16, float>(float val) {
+    return __float2bfloat16(val);
+}
+template<>
+__device__ __nv_bfloat16 cast_value<__nv_bfloat16, half>(half val) {
+    return __float2bfloat16(__half2float(val));
+}
+
 #if defined(ENABLE_FP8_E4M3) || defined(ENABLE_FP8_E5M2)
 // BF16 → FP8: go through float as the intermediate.
 // The hardware FP8 cast (via __nv_fp8_e4m3/__nv_fp8_e5m2 constructors) accepts float.
