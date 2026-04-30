@@ -99,16 +99,18 @@ enum PTQPrecision {
     PTQ_PRECISION_NONE = 0,
     PTQ_PRECISION_INT8 = 1,
     PTQ_PRECISION_FP8 = 2,
+    PTQ_PRECISION_INT4 = 3,
 };
 
 constexpr const int NUM_PARAMETER_TENSORS = 16;
 
 typedef struct {
-    uint8_t* qvalues; // quantized payload, row-major
+    uint8_t* qvalues; // quantized payload, row-major. int4 stores two logical values per byte.
     float* scales;    // one scale per output row
     int num_layers;
     int rows_per_layer;
     int cols;
+    size_t qvalue_bytes;
     bool initialized;
 } QuantizedTensor;
 
@@ -118,6 +120,7 @@ const char* ptq_precision_to_string(PTQPrecision precision) {
     switch (precision) {
         case PTQ_PRECISION_INT8: return "int8";
         case PTQ_PRECISION_FP8: return "fp8";
+        case PTQ_PRECISION_INT4: return "int4";
         default: return "none";
     }
 }
@@ -126,8 +129,24 @@ PTQPrecision ptq_precision_from_string(const char* value) {
     if (strcmp(value, "none") == 0) { return PTQ_PRECISION_NONE; }
     if (strcmp(value, "int8") == 0) { return PTQ_PRECISION_INT8; }
     if (strcmp(value, "fp8") == 0) { return PTQ_PRECISION_FP8; }
-    fprintf(stderr, "Unsupported PTQ precision '%s'. Expected one of: int8, fp8.\n", value);
+    if (strcmp(value, "int4") == 0) { return PTQ_PRECISION_INT4; }
+    fprintf(stderr, "Unsupported PTQ precision '%s'. Expected one of: int8, fp8, int4.\n", value);
     exit(EXIT_FAILURE);
+}
+
+__host__ __device__ inline bool ptq_precision_is_supported(PTQPrecision precision) {
+    return precision == PTQ_PRECISION_INT8 || precision == PTQ_PRECISION_FP8 ||
+           precision == PTQ_PRECISION_INT4;
+}
+
+__host__ __device__ inline float ptq_quant_max(PTQPrecision precision) {
+    if (precision == PTQ_PRECISION_INT8) { return 127.0f; }
+    if (precision == PTQ_PRECISION_INT4) { return 7.0f; }
+    return FP8_E4M3_MAX;
+}
+
+__host__ __device__ inline size_t ptq_qvalue_bytes(size_t logical_elements, PTQPrecision precision) {
+    return precision == PTQ_PRECISION_INT4 ? (logical_elements + 1) / 2 : logical_elements;
 }
 
 __host__ __device__ inline float ptq_decode_fp8_e4m3(uint8_t raw) {
@@ -136,42 +155,91 @@ __host__ __device__ inline float ptq_decode_fp8_e4m3(uint8_t raw) {
     return (float)value;
 }
 
+__host__ __device__ inline int ptq_decode_int4_nibble(uint8_t nibble) {
+    constexpr int INT4_BITS = 4;
+    constexpr uint8_t INT4_MASK = (1u << INT4_BITS) - 1u;
+    return (int)((int8_t)((nibble & INT4_MASK) << INT4_BITS) >> INT4_BITS);
+}
+
+__host__ __device__ inline uint8_t ptq_encode_int4_nibble(int value) {
+    return (uint8_t)(value & 0x0F);
+}
+
+__host__ __device__ inline uint8_t ptq_pack_int4_pair(int low, int high) {
+    return ptq_encode_int4_nibble(low) | (ptq_encode_int4_nibble(high) << 4);
+}
+
+__host__ __device__ inline float ptq_unpack_decode_value(const uint8_t* qvalues, size_t logical_idx,
+                                                         PTQPrecision precision) {
+    if (precision == PTQ_PRECISION_INT8) {
+        const uint8_t raw = qvalues[logical_idx];
+        return (float)((int8_t)raw);
+    }
+    if (precision == PTQ_PRECISION_FP8) {
+        const uint8_t raw = qvalues[logical_idx];
+        return ptq_decode_fp8_e4m3(raw);
+    }
+    if (precision == PTQ_PRECISION_INT4) {
+        const uint8_t packed = qvalues[logical_idx >> 1];
+        const uint8_t nibble = (logical_idx & 1) ? (packed >> 4) : (packed & 0x0F);
+        return (float)ptq_decode_int4_nibble(nibble);
+    }
+    return 0.0f;
+}
+
 __host__ __device__ uint8_t ptq_encode_fp8_e4m3(float value) {
     return __nv_fp8_e4m3(value).__x;
 }
 
 void ptq_quantize_rows_host(uint8_t* dst, float* scales, const float* src, int rows, int cols, PTQPrecision precision) {
-    assert(precision == PTQ_PRECISION_INT8 || precision == PTQ_PRECISION_FP8);
-    const float quant_max = precision == PTQ_PRECISION_INT8 ? 127.0f : FP8_E4M3_MAX;
+    assert(ptq_precision_is_supported(precision));
+    const float quant_max = ptq_quant_max(precision);
     for (int row = 0; row < rows; ++row) {
         const float* row_src = src + row * cols;
-        uint8_t* row_dst = dst + row * cols;
         float max_abs = 0.0f;
         for (int col = 0; col < cols; ++col) {
             max_abs = fmaxf(max_abs, fabsf(row_src[col]));
         }
         float scale = max_abs > 0.0f ? max_abs / quant_max : 1.0f;
         scales[row] = scale;
+    }
+
+    if (precision == PTQ_PRECISION_INT4) {
+        memset(dst, 0, ptq_qvalue_bytes((size_t)rows * cols, precision));
+    }
+
+    for (int row = 0; row < rows; ++row) {
+        const float* row_src = src + row * cols;
+        const float scale = scales[row];
         for (int col = 0; col < cols; ++col) {
             const float scaled = row_src[col] / scale;
             if (precision == PTQ_PRECISION_INT8) {
                 const int q = (int)lrintf(fmaxf(-127.0f, fminf(127.0f, scaled)));
-                row_dst[col] = (uint8_t)((int8_t)q);
+                dst[(size_t)row * cols + col] = (uint8_t)((int8_t)q);
+            } else if (precision == PTQ_PRECISION_FP8) {
+                dst[(size_t)row * cols + col] = ptq_encode_fp8_e4m3(scaled);
             } else {
-                row_dst[col] = ptq_encode_fp8_e4m3(scaled);
+                const size_t idx = (size_t)row * cols + col;
+                const int q = (int)lrintf(fmaxf(-7.0f, fminf(7.0f, scaled)));
+                uint8_t* packed = dst + (idx >> 1);
+                if (idx & 1) {
+                    *packed = (*packed & 0x0F) | (ptq_encode_int4_nibble(q) << 4);
+                } else {
+                    *packed = (*packed & 0xF0) | ptq_encode_int4_nibble(q);
+                }
             }
         }
     }
 }
 
 void ptq_dequantize_rows_host(float* dst, const uint8_t* src, const float* scales, int rows, int cols, PTQPrecision precision) {
-    assert(precision == PTQ_PRECISION_INT8 || precision == PTQ_PRECISION_FP8);
+    assert(ptq_precision_is_supported(precision));
     for (int row = 0; row < rows; ++row) {
         const float scale = scales[row];
         for (int col = 0; col < cols; ++col) {
-            const uint8_t raw = src[row * cols + col];
-            const float q = precision == PTQ_PRECISION_INT8 ? (float)((int8_t)raw) : ptq_decode_fp8_e4m3(raw);
-            dst[row * cols + col] = scale * q;
+            const size_t idx = (size_t)row * cols + col;
+            const float q = ptq_unpack_decode_value(src, idx, precision);
+            dst[idx] = scale * q;
         }
     }
 }
@@ -182,8 +250,7 @@ __global__ void ptq_dequantize_rows_kernel(floatX* dst, const uint8_t* src, cons
     const int count = rows * cols;
     if (idx >= count) { return; }
     const int row = idx / cols;
-    const uint8_t raw = src[idx];
-    const float q = precision == PTQ_PRECISION_INT8 ? (float)((int8_t)raw) : ptq_decode_fp8_e4m3(raw);
+    const float q = ptq_unpack_decode_value(src, (size_t)idx, precision);
     dst[idx] = (floatX)(scales[row] * q);
 }
 
@@ -270,6 +337,29 @@ __global__ void ptq_quantize_apply_kernel(uint8_t* __restrict__ dst,
     }
 }
 
+__global__ void ptq_quantize_apply_int4_kernel(uint8_t* __restrict__ dst,
+                                               const floatX* __restrict__ src,
+                                               const float* __restrict__ scales,
+                                               int rows, int cols) {
+    const int byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int count = rows * cols;
+    const int idx0 = byte_idx * 2;
+    if (idx0 >= count) return;
+
+    const int row0 = idx0 / cols;
+    const float val0 = (float)src[idx0] / scales[row0];
+    const int q0 = (int)lrintf(fmaxf(-7.0f, fminf(7.0f, val0)));
+
+    int q1 = 0;
+    const int idx1 = idx0 + 1;
+    if (idx1 < count) {
+        const int row1 = idx1 / cols;
+        const float val1 = (float)src[idx1] / scales[row1];
+        q1 = (int)lrintf(fmaxf(-7.0f, fminf(7.0f, val1)));
+    }
+    dst[byte_idx] = ptq_pack_int4_pair(q0, q1);
+}
+
 // Pass 2b: quantize from FP32 using precomputed scales.
 __global__ void ptq_quantize_apply_fp32_kernel(uint8_t* __restrict__ dst,
                                                const float* __restrict__ src,
@@ -287,18 +377,47 @@ __global__ void ptq_quantize_apply_fp32_kernel(uint8_t* __restrict__ dst,
     }
 }
 
+__global__ void ptq_quantize_apply_int4_fp32_kernel(uint8_t* __restrict__ dst,
+                                                    const float* __restrict__ src,
+                                                    const float* __restrict__ scales,
+                                                    int rows, int cols) {
+    const int byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int count = rows * cols;
+    const int idx0 = byte_idx * 2;
+    if (idx0 >= count) return;
+
+    const int row0 = idx0 / cols;
+    const float val0 = src[idx0] / scales[row0];
+    const int q0 = (int)lrintf(fmaxf(-7.0f, fminf(7.0f, val0)));
+
+    int q1 = 0;
+    const int idx1 = idx0 + 1;
+    if (idx1 < count) {
+        const int row1 = idx1 / cols;
+        const float val1 = src[idx1] / scales[row1];
+        q1 = (int)lrintf(fmaxf(-7.0f, fminf(7.0f, val1)));
+    }
+    dst[byte_idx] = ptq_pack_int4_pair(q0, q1);
+}
+
 // GPU quantize from floatX. row_maxes_scratch is a caller-owned device buffer of `rows` floats.
 void ptq_quantize_rows_gpu(uint8_t* dst, float* scales, float* row_maxes_scratch,
                             const floatX* src, int rows, int cols,
                             PTQPrecision precision, cudaStream_t stream) {
-    const float quant_max = (precision == PTQ_PRECISION_INT8) ? 127.0f : FP8_E4M3_MAX;
+    const float quant_max = ptq_quant_max(precision);
     ptq_find_row_max_kernel<<<rows, 256, 0, stream>>>(row_maxes_scratch, src, rows, cols);
     cudaCheck(cudaGetLastError());
     ptq_write_scales_kernel<<<CEIL_DIV(rows, 256), 256, 0, stream>>>(
         scales, row_maxes_scratch, rows, quant_max);
     cudaCheck(cudaGetLastError());
-    ptq_quantize_apply_kernel<<<CEIL_DIV(rows * cols, 256), 256, 0, stream>>>(
-        dst, src, scales, rows, cols, precision);
+    if (precision == PTQ_PRECISION_INT4) {
+        const int qbytes = (int)ptq_qvalue_bytes((size_t)rows * cols, precision);
+        ptq_quantize_apply_int4_kernel<<<CEIL_DIV(qbytes, 256), 256, 0, stream>>>(
+            dst, src, scales, rows, cols);
+    } else {
+        ptq_quantize_apply_kernel<<<CEIL_DIV(rows * cols, 256), 256, 0, stream>>>(
+            dst, src, scales, rows, cols, precision);
+    }
     cudaCheck(cudaGetLastError());
 }
 
@@ -306,14 +425,20 @@ void ptq_quantize_rows_gpu(uint8_t* dst, float* scales, float* row_maxes_scratch
 void ptq_quantize_rows_gpu_fp32(uint8_t* dst, float* scales, float* row_maxes_scratch,
                                 const float* src, int rows, int cols,
                                 PTQPrecision precision, cudaStream_t stream) {
-    const float quant_max = (precision == PTQ_PRECISION_INT8) ? 127.0f : FP8_E4M3_MAX;
+    const float quant_max = ptq_quant_max(precision);
     ptq_find_row_max_fp32_kernel<<<rows, 256, 0, stream>>>(row_maxes_scratch, src, rows, cols);
     cudaCheck(cudaGetLastError());
     ptq_write_scales_kernel<<<CEIL_DIV(rows, 256), 256, 0, stream>>>(
         scales, row_maxes_scratch, rows, quant_max);
     cudaCheck(cudaGetLastError());
-    ptq_quantize_apply_fp32_kernel<<<CEIL_DIV(rows * cols, 256), 256, 0, stream>>>(
-        dst, src, scales, rows, cols, precision);
+    if (precision == PTQ_PRECISION_INT4) {
+        const int qbytes = (int)ptq_qvalue_bytes((size_t)rows * cols, precision);
+        ptq_quantize_apply_int4_fp32_kernel<<<CEIL_DIV(qbytes, 256), 256, 0, stream>>>(
+            dst, src, scales, rows, cols);
+    } else {
+        ptq_quantize_apply_fp32_kernel<<<CEIL_DIV(rows * cols, 256), 256, 0, stream>>>(
+            dst, src, scales, rows, cols, precision);
+    }
     cudaCheck(cudaGetLastError());
 }
 
@@ -323,10 +448,11 @@ void ptq_dequantize_layer_slice(floatX* dst, const QuantizedTensor* qt,
                                 int layer, PTQPrecision precision, cudaStream_t stream) {
     const int rows = qt->rows_per_layer;
     const int cols = qt->cols;
+    assert(precision != PTQ_PRECISION_INT4 || (((size_t)rows * cols) % 2 == 0));
     const size_t elem_offset  = (size_t)layer * rows * cols;
     const size_t scale_offset = (size_t)layer * rows;
     ptq_dequantize_rows(dst,
-                        qt->qvalues + elem_offset,
+                        qt->qvalues + ptq_qvalue_bytes(elem_offset, precision),
                         qt->scales  + scale_offset,
                         rows, cols, precision, stream);
 }
@@ -731,7 +857,7 @@ void gpt2_prepare_ptq(GPT2 *model) {
         gpt2_clear_ptq(model);
         return;
     }
-    if (model->ptq_precision != PTQ_PRECISION_INT8 && model->ptq_precision != PTQ_PRECISION_FP8) {
+    if (!ptq_precision_is_supported(model->ptq_precision)) {
         fprintf(stderr, "PTQ precision '%s' is not supported.\n", ptq_precision_to_string(model->ptq_precision));
         exit(EXIT_FAILURE);
     }
@@ -772,21 +898,28 @@ void gpt2_prepare_ptq(GPT2 *model) {
         PTQTensorLayout layout = ptq_tensor_layout_for_index(model->config, i);
         const size_t total_rows     = (size_t)layout.num_layers * layout.rows_per_layer;
         const size_t total_elements = total_rows * layout.cols;
+        const size_t qbytes         = ptq_qvalue_bytes(total_elements, model->ptq_precision);
         assert(total_elements == model->param_elements[i]);
 
         QuantizedTensor* qt = &model->ptq.tensors[i];
+        if (qt->initialized && qt->qvalue_bytes != qbytes) {
+            cudaFreeCheck(&qt->qvalues);
+            cudaFreeCheck(&qt->scales);
+            qt->qvalue_bytes = 0;
+            qt->initialized = false;
+        }
         if (!qt->initialized) {
-            cudaCheck(cudaMalloc((void**)&qt->qvalues, total_elements * sizeof(uint8_t)));
+            cudaCheck(cudaMalloc((void**)&qt->qvalues, qbytes));
             cudaCheck(cudaMalloc((void**)&qt->scales,  total_rows     * sizeof(float)));
             qt->num_layers     = layout.num_layers;
             qt->rows_per_layer = layout.rows_per_layer;
             qt->cols           = layout.cols;
+            qt->qvalue_bytes   = qbytes;
             qt->initialized    = true;
-            model->ptq.original_weight_bytes += total_elements * sizeof(floatX);
-            model->ptq.quantized_weight_bytes += total_elements * sizeof(uint8_t)
-                                               + total_rows     * sizeof(float);
             model->ptq.num_quantized_tensors += 1;
         }
+        model->ptq.original_weight_bytes += total_elements * sizeof(floatX);
+        model->ptq.quantized_weight_bytes += qbytes + total_rows * sizeof(float);
         // GPU-quantize: floatX params -> uint8 qvalues + float scales
         ptq_quantize_rows_gpu(qt->qvalues, qt->scales, model->row_maxes_scratch,
                               *src_ptrs[i], (int)total_rows, layout.cols,
@@ -873,7 +1006,7 @@ void gpt2_prepare_ptq(GPT2 *model) {
         if (ptq_should_quantize_tensor(i)) {
             PTQTensorLayout lo = ptq_tensor_layout_for_index(model->config, i);
             size_t total_rows  = (size_t)lo.num_layers * lo.rows_per_layer;
-            double qval_mib    = (double)(elems * sizeof(uint8_t))    / (1024.0 * 1024.0);
+            double qval_mib    = (double)ptq_qvalue_bytes(elems, model->ptq_precision) / (1024.0 * 1024.0);
             double scale_mib   = (double)(total_rows * sizeof(float)) / (1024.0 * 1024.0);
             newmib = qval_mib + scale_mib;
             saved  = orig - newmib;
@@ -886,7 +1019,8 @@ void gpt2_prepare_ptq(GPT2 *model) {
                 parameter_tensor_name(i), marker, elems, orig, newmib, saved);
     }
     printf0("+-----------------+----------+-----------+-----------+-----------+\n");
-    printf0("  * = quantized (int8 qvalues + float scales stored in beast ptq)\n");
+    printf0("  * = quantized (%s qvalues + float scales stored in beast ptq)\n",
+            ptq_precision_to_string(model->ptq_precision));
     printf0("\n");
     printf0("  scratch_dequant  (reused per layer, NOT persistent)  : %6.2f MiB\n",
             (double)scratch_bytes / (1024.0 * 1024.0));
@@ -1027,12 +1161,20 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     //   8 = bf16 + beast-mode int8 PTQ
     //   9 = fp32 + beast-mode fp8 PTQ
     //  10 = bf16 + beast-mode fp8 PTQ
+    //  11 = fp32 + beast-mode int4 PTQ
+    //  12 = bf16 + beast-mode int4 PTQ
     bool beast = model->ptq_enabled && model->ptq.initialized;
     if (!beast) {
         model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5;
     } else {
         int base = PRECISION_MODE == PRECISION_FP32 ? 7 : 8;
-        model_header[1] = base + (model->ptq_precision == PTQ_PRECISION_FP8 ? 2 : 0);
+        int precision_offset = 0;
+        if (model->ptq_precision == PTQ_PRECISION_FP8) {
+            precision_offset = 2;
+        } else if (model->ptq_precision == PTQ_PRECISION_INT4) {
+            precision_offset = 4;
+        }
+        model_header[1] = base + precision_offset;
         model_header[8] = (int)model->ptq_precision; // store precision enum in header
     }
     model_header[2] = model->config.max_seq_len;
@@ -1060,7 +1202,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
             } else {
                 const QuantizedTensor* qt = &model->ptq.tensors[i];
                 size_t total_rows = (size_t)qt->num_layers * qt->rows_per_layer;
-                size_t qbytes     = (size_t)total_rows * qt->cols * sizeof(uint8_t);
+                size_t qbytes     = qt->qvalue_bytes;
                 size_t sbytes     = total_rows * sizeof(float);
                 device_to_file(model_file, qt->qvalues, qbytes, IO_BUF_SIZE, main_stream);
                 device_to_file(model_file, qt->scales,  sbytes, IO_BUF_SIZE, main_stream);
@@ -1087,7 +1229,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     // Accepted versions:
     //  3 = fp32 (original)       5 = bf16 (original)
     //  7/8 = fp32/bf16 + beast int8    9/10 = fp32/bf16 + beast fp8
-    bool is_beast_ckpt = (version >= 7 && version <= 10);
+    //  11/12 = fp32/bf16 + beast int4
+    bool is_beast_ckpt = (version >= 7 && version <= 12);
     if (!(version == 3 || version == 5 || is_beast_ckpt)) {
         fprintf(stderr, "Bad version in model file\n");
         fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
@@ -1128,28 +1271,39 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
             // Unquantized tensors → loaded as floatX into params.* slots.
             // Quantized tensors   → loaded as (qvalues uint8, scales float) into ptq.tensors[i].
             PTQPrecision ckpt_prec = (PTQPrecision)model_header[8];
-            (void)ckpt_prec; // reserved for future format validation
+            if (!ptq_precision_is_supported(ckpt_prec)) {
+                fprintf(stderr, "Unsupported PTQ precision in checkpoint: %d\n", (int)ckpt_prec);
+                exit(EXIT_FAILURE);
+            }
+            model->ptq_precision = ckpt_prec;
+            model->ptq.original_weight_bytes = 0;
+            model->ptq.quantized_weight_bytes = 0;
+            model->ptq.num_quantized_tensors = 0;
             floatX** ptrs[NUM_PARAMETER_TENSORS];
             get_parameter_tensor_ptrs(&model->params, ptrs);
             for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
                 PTQTensorLayout layout = ptq_tensor_layout_for_index(model->config, i);
                 size_t total_rows     = (size_t)layout.num_layers * layout.rows_per_layer;
                 size_t total_elements = total_rows * layout.cols;
+                size_t qbytes         = ptq_qvalue_bytes(total_elements, ckpt_prec);
                 if (!ptq_should_quantize_tensor(i)) {
                     size_t bytes = model->param_elements[i] * sizeof(floatX);
                     file_to_device(*(ptrs[i]), model_file, bytes, IO_BUF_SIZE, main_stream);
                 } else {
                     QuantizedTensor* qt = &model->ptq.tensors[i];
                     if (!qt->initialized) {
-                        cudaCheck(cudaMalloc((void**)&qt->qvalues, total_elements * sizeof(uint8_t)));
+                        cudaCheck(cudaMalloc((void**)&qt->qvalues, qbytes));
                         cudaCheck(cudaMalloc((void**)&qt->scales,  total_rows     * sizeof(float)));
                         qt->num_layers     = layout.num_layers;
                         qt->rows_per_layer = layout.rows_per_layer;
                         qt->cols           = layout.cols;
+                        qt->qvalue_bytes   = qbytes;
                         qt->initialized    = true;
                     }
-                    file_to_device(qt->qvalues, model_file, total_elements * sizeof(uint8_t),
-                                   IO_BUF_SIZE, main_stream);
+                    model->ptq.original_weight_bytes += total_elements * sizeof(floatX);
+                    model->ptq.quantized_weight_bytes += qbytes + total_rows * sizeof(float);
+                    model->ptq.num_quantized_tensors += 1;
+                    file_to_device(qt->qvalues, model_file, qbytes, IO_BUF_SIZE, main_stream);
                     file_to_device(qt->scales,  model_file, total_rows     * sizeof(float),
                                    IO_BUF_SIZE, main_stream);
                 }
@@ -1864,6 +2018,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             // ----------------------------------------------------------------
             QuantizedTensor* qt = &model->ptq.tensors[i];
             const size_t layer_elems = (size_t)qt->rows_per_layer * qt->cols; // elements per layer
+            assert(model->ptq_precision != PTQ_PRECISION_INT4 || (layer_elems % 2 == 0));
             // grad tensor offset for layer 0 of this tensor (grads_memory layout is same as original params_memory)
             floatX* grad_base = (floatX*)model->grads_memory + tensor.offset;
 
@@ -1898,8 +2053,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                     if (src != nullptr) {
                         size_t scale_offset = (size_t)l * qt->rows_per_layer;
                         size_t elem_offset  = (size_t)l * qt->rows_per_layer * qt->cols;
+                        size_t byte_offset  = ptq_qvalue_bytes(elem_offset, model->ptq_precision);
                         ptq_quantize_rows_gpu_fp32(
-                            qt->qvalues + elem_offset,
+                            qt->qvalues + byte_offset,
                             qt->scales  + scale_offset,
                             model->row_maxes_scratch,
                             src, qt->rows_per_layer, qt->cols,
@@ -1911,8 +2067,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                     if (master_ptr != nullptr) {
                         size_t scale_offset = (size_t)l * qt->rows_per_layer;
                         size_t elem_offset  = (size_t)l * qt->rows_per_layer * qt->cols;
+                        size_t byte_offset  = ptq_qvalue_bytes(elem_offset, model->ptq_precision);
                         ptq_quantize_rows_gpu_fp32(
-                            qt->qvalues + elem_offset,
+                            qt->qvalues + byte_offset,
                             qt->scales  + scale_offset,
                             model->row_maxes_scratch,
                             layer_master_ptr, qt->rows_per_layer, qt->cols,
@@ -2230,7 +2387,7 @@ void error_usage() {
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
     fprintf(stderr, "  --ptq <0|1>           enable row-wise PTQ for large weight tensors (default = 0)\n");
-    fprintf(stderr, "  --ptq_precision <str> PTQ precision for quantized weights: int8|fp8 (default = int8)\n");
+    fprintf(stderr, "  --ptq_precision <str> PTQ precision for quantized weights: int8|fp8|int4 (default = int8)\n");
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
     fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
