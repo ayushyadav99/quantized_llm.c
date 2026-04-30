@@ -10,6 +10,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <cuda_fp8.h>
 // ----------- CPU utilities -----------
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 // defines: create_dir_if_not_exists, find_max_step, ends_with_bin
@@ -130,54 +131,13 @@ PTQPrecision ptq_precision_from_string(const char* value) {
 }
 
 __host__ __device__ inline float ptq_decode_fp8_e4m3(uint8_t raw) {
-    const float sign = (raw & 0x80) ? -1.0f : 1.0f;
-    const int exponent = (raw >> 3) & 0x0F;
-    const int mantissa = raw & 0x07;
-    if (exponent == 0) {
-        if (mantissa == 0) { return copysignf(0.0f, sign); }
-        return sign * ((float)mantissa / 512.0f);
-    }
-    if (exponent == 0x0F) {
-        return sign * FP8_E4M3_MAX;
-    }
-    return sign * ldexpf(1.0f + (float)mantissa / 8.0f, exponent - 7);
+    __nv_fp8_e4m3 value;
+    value.__x = raw;
+    return (float)value;
 }
 
 __host__ __device__ uint8_t ptq_encode_fp8_e4m3(float value) {
-    if (value == 0.0f) {
-        return signbit(value) ? 0x80 : 0x00;
-    }
-
-    const uint8_t sign = signbit(value) ? 0x80 : 0x00;
-    float abs_value = fabsf(value);
-    abs_value = fminf(abs_value, FP8_E4M3_MAX);
-
-    if (abs_value < (1.0f / 512.0f)) {
-        return sign;
-    }
-
-    if (abs_value < 0.015625f) {
-        int mantissa = (int)lrintf(abs_value * 512.0f);
-        mantissa = max(1, min(7, mantissa));
-        return sign | (uint8_t)mantissa;
-    }
-
-    int exponent = 0;
-    float normalized = frexpf(abs_value, &exponent); // abs_value = normalized * 2^exponent, normalized in [0.5, 1)
-    normalized *= 2.0f;
-    exponent -= 1;
-    int exponent_field = exponent + 7;
-    int mantissa = (int)lrintf((normalized - 1.0f) * 8.0f);
-    if (mantissa == 8) {
-        mantissa = 0;
-        exponent_field += 1;
-    }
-    if (exponent_field >= 0x0F) {
-        exponent_field = 0x0E;
-        mantissa = 0x07;
-    }
-    exponent_field = max(1, exponent_field);
-    return sign | (uint8_t)(exponent_field << 3) | (uint8_t)mantissa;
+    return __nv_fp8_e4m3(value).__x;
 }
 
 void ptq_quantize_rows_host(uint8_t* dst, float* scales, const float* src, int rows, int cols, PTQPrecision precision) {
@@ -2234,7 +2194,7 @@ void error_usage() {
     fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
     fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
     fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code comments as docs. (default = gpt2_124M_bf16.bin)\n");
-    fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
+    fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging; writes main.log and train_losses.csv)\n");
     fprintf(stderr, "  -lg <int>   log gpu info every x steps (default = -1; disabled)\n");
     fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
     fprintf(stderr, "  -nk <int>   max number of checkpoints to keep in the directory, removing old ones (0 = disable, default)\n");
@@ -2289,7 +2249,7 @@ int main(int argc, char *argv[]) {
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* lr_scheduler_type = "cosine";
-    const char* output_log_dir = NULL;
+    const char* output_log_dir = "logs";
     int checkpoint_every = 0; // write checkpoints every how many steps?
     int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
     int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
@@ -2760,6 +2720,8 @@ int main(int argc, char *argv[]) {
                     gpu_info.temperature, gpu_info.temp_slowdown, gpu_info.throttle_reason);
         }
         logger_log_train(&logger, step, model.mean_loss, step_learning_rate, grad_norm);
+        logger_log_train_loss(&logger, step + 1, model.mean_loss, step_learning_rate, grad_norm,
+                              zloss, zgrad, time_elapsed_ms, bias_corrected_ema_tokens_per_second);
 
         // disable the profiler after 3 steps of optimization
         if (step == 3) { cudaProfilerStop(); }

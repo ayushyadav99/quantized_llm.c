@@ -14,6 +14,7 @@ The Logger object is stateless and uses append mode to write to log files.
 typedef struct {
     int active;
     char output_log_file[512];
+    char train_loss_file[512];
 } Logger;
 
 void logger_init(Logger *logger, const char *log_dir, int process_rank, int resume) {
@@ -23,10 +24,14 @@ void logger_init(Logger *logger, const char *log_dir, int process_rank, int resu
         logger->active = 1;
         assert(strlen(log_dir) < 500); // being a bit lazy, could relax later
         snprintf(logger->output_log_file, 512, "%s/main.log", log_dir);
+        snprintf(logger->train_loss_file, 512, "%s/train_losses.csv", log_dir);
         if (resume == 0) {
             // wipe any existing logfile clean if we're starting fresh
             FILE *logfile = fopenCheck(logger->output_log_file, "w");
             fclose(logfile);
+            FILE *lossfile = fopenCheck(logger->train_loss_file, "w");
+            fprintf(lossfile, "step,train_loss,learning_rate,grad_norm,zloss,zgrad,time_ms,tokens_per_second\n");
+            fclose(lossfile);
         }
     }
 }
@@ -52,6 +57,16 @@ void logger_log_train(Logger *logger, int step, float train_loss, float learning
         FILE *logfile = fopenCheck(logger->output_log_file, "a");
         fprintf(logfile, "s:%d trl:%.4f lr:%.6f norm:%.2f\n", step, train_loss, learning_rate, grad_norm);
         fclose(logfile);
+    }
+}
+
+void logger_log_train_loss(Logger *logger, int step, float train_loss, float learning_rate, float grad_norm,
+                           float zloss, float zgrad, float time_ms, float tokens_per_second) {
+    if (logger->active == 1) {
+        FILE *lossfile = fopenCheck(logger->train_loss_file, "a");
+        fprintf(lossfile, "%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+                step, train_loss, learning_rate, grad_norm, zloss, zgrad, time_ms, tokens_per_second);
+        fclose(lossfile);
     }
 }
 
