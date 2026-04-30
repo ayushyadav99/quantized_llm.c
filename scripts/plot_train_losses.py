@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Plot training loss CSVs.
+
+Plot all train loss dumps in logs/:
+    python3 plot_train_losses.py logs --all-logs --smooth 10 -o loss.svg
+"""
+
 import argparse
 import csv
 import math

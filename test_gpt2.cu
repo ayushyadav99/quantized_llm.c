@@ -305,6 +305,7 @@ int main(int argc, char *argv[]) {
 
     allok &= check_ptq_roundtrip(PTQ_PRECISION_INT8, 0.03f, 0.01f, 0.20f, 1e-2f);
     allok &= check_ptq_roundtrip(PTQ_PRECISION_FP8, 3.00f, 0.35f, 0.75f, 1e-2f);
+    allok &= check_ptq_roundtrip(PTQ_PRECISION_INT4, 0.45f, 0.15f, 1.00f, 1e-1f);
     allok &= check_ptq_forward_regression(&model, x, y, B, T, logits_cpu, V, Vp);
 
     // let's do 10 training iterations, following the pytorch code
