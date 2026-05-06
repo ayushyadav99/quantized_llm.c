@@ -81,8 +81,10 @@ static void test_round_trip(const char* name, float* data, int n) {
     printf("%-22s k=%5.2f | COAT: max=%.2e rmse=%.2e | naive: max=%.2e rmse=%.2e | %.2fx better\n",
            name, k, coat_max_err, coat_mse, naive_max_err, naive_mse, improvement);
 
-    // COAT must not be meaningfully worse than naive (allow 1% slack for rounding).
-    if (coat_max_err > naive_max_err * 1.01f) {
+    // COAT must not be meaningfully worse than naive.
+    // The 1e-9 absolute term absorbs 1-ULP float32 rounding (e.g. x*(1/s) vs x/s)
+    // which is an artifact of operation ordering, not a real quantization error.
+    if (coat_max_err > naive_max_err * 1.01f + 1e-9f) {
         printf("  !! FAIL: COAT was worse than naive for '%s'\n", name);
     }
 }
