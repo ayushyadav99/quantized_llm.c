@@ -112,8 +112,18 @@ __host__ __device__ inline void coat_quantize_group(
     // Degenerate case: single unique magnitude — no range to expand.
     if (min_abs >= max_abs) min_abs = max_abs;
 
-    float R_actual    = max_abs / min_abs;
-    float k           = coat_compute_k(R_actual);
+    float R_actual = max_abs / min_abs;
+    float k        = coat_compute_k(R_actual);
+
+    // Guard: when max_abs < 1, large k causes max_abs^k to underflow in float32,
+    // making scale = FP8_MAX / 0 = inf. Cap k so max_abs^k >= sqrt(FLT_MIN) ~1e-19,
+    // which keeps scale <= 4e21 — well within float32 range.
+    // sqrt(FLT_MIN) = 1.08e-19, log(1.08e-19) = -43.668
+    if (max_abs > 0.0f && max_abs < 1.0f) {
+        float k_limit = -43.668f / logf(max_abs);   // logf(max_abs) < 0, so k_limit > 0
+        k = fminf(k, k_limit);
+    }
+
     float max_expanded = powf(max_abs, k);      // largest value after expansion
     float scale        = COAT_FP8_MAX / max_expanded;  // maps max_expanded -> 448
 
