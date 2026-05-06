@@ -63,7 +63,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: adamw_kernel3
 #include "llmc/adamw.cuh"
 // defines: coat_quantize_group, coat_dequantize_group, coat_expand, coat_unexpand
-// compile with -DCOAT_OPTIM to enable FP8 optimizer state compression
+// pass --coat_optim 1 at runtime to enable FP8 optimizer state compression
 #include "llmc/coat_fp8_optim.cuh"
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
@@ -828,18 +828,17 @@ typedef struct {
     ParameterTensors grads;
     void* grads_memory;
     // AdamW optimizer state.
-    // Without COAT_OPTIM: FP32 first (m) and second (v) moments — standard mixed precision.
-    // With    COAT_OPTIM: m_memory/v_memory are always nullptr; FP8 layout below is active.
+    // coat_optim=0: FP32 first (m) and second (v) moments — standard mixed precision.
+    // coat_optim=1: m_memory/v_memory are always nullptr; FP8 layout below is active.
+    int coat_optim;      // 1 = use COAT FP8 optimizer states, 0 = standard FP32 moments
     float* m_memory;
     float* v_memory;
-#ifdef COAT_OPTIM
     uint8_t* m_fp8;      // FP8 E4M3 first moment, one byte per parameter
     uint8_t* v_fp8;      // FP8 E4M3 second moment, one byte per parameter
     float*   m_scales;   // absmax scale, one float per COAT_GROUP_SIZE parameters
     float*   v_scales;
     float*   m_kfactors; // expansion exponent k, one float per COAT_GROUP_SIZE parameters
     float*   v_kfactors;
-#endif
     float* master_weights;     // optional FP32 copy of params used for numerically safer updates
     // the activations of the model, and their sizes
     ActivationTensors acts;
@@ -913,16 +912,15 @@ void gpt2_init_common(GPT2 *model) {
     model->workload_indices = NULL; // on cpu, for encoder_backward
     model->bucket_info = NULL; // on cpu, for encoder_backward
     // memory lazily initialized in update()
-    model->m_memory = NULL;
-    model->v_memory = NULL;
-#ifdef COAT_OPTIM
-    model->m_fp8      = nullptr;
-    model->v_fp8      = nullptr;
-    model->m_scales   = nullptr;
-    model->v_scales   = nullptr;
-    model->m_kfactors = nullptr;
-    model->v_kfactors = nullptr;
-#endif
+    model->coat_optim  = 0;
+    model->m_memory    = NULL;
+    model->v_memory    = NULL;
+    model->m_fp8       = nullptr;
+    model->v_fp8       = nullptr;
+    model->m_scales    = nullptr;
+    model->v_scales    = nullptr;
+    model->m_kfactors  = nullptr;
+    model->v_kfactors  = nullptr;
     model->master_weights = NULL;
     // beast-mode PTQ scratch (allocated in gpt2_prepare_ptq and gpt2_allocate_state)
     model->scratch_dequant = NULL;
@@ -1241,31 +1239,31 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     // regardless of whether params/grads are stored as BF16 or FP32.
     // This is where most of the training-time "mixed precision" memory split is set up.
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters; // num parameters we are responsible for
-#ifndef COAT_OPTIM
-    printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
-    printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
-    assert(model->m_memory == nullptr);
-    assert(model->v_memory == nullptr);
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->m_memory, shard_num_parameters * sizeof(float));
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->v_memory, shard_num_parameters * sizeof(float));
-#else
-    // COAT FP8 layout: 1 byte/param for FP8 + 2 floats/group for (scale, k).
-    // Total overhead: ~1.0625 bytes/param vs 4 bytes/param for FP32 — ~3.76x reduction.
-    size_t coat_num_groups = CEIL_DIV(shard_num_parameters, COAT_GROUP_SIZE);
-    size_t coat_fp8_bytes  = shard_num_parameters * sizeof(uint8_t);
-    size_t coat_meta_bytes = coat_num_groups * sizeof(float);
-    printf0("allocating %zu MiB for COAT FP8 optimizer state m (fp8 + scales + kfactors)\n",
-            (coat_fp8_bytes + 2 * coat_meta_bytes) >> 20);
-    printf0("allocating %zu MiB for COAT FP8 optimizer state v (fp8 + scales + kfactors)\n",
-            (coat_fp8_bytes + 2 * coat_meta_bytes) >> 20);
-    assert(model->m_fp8 == nullptr && model->v_fp8 == nullptr);
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->m_fp8,      coat_fp8_bytes);
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->v_fp8,      coat_fp8_bytes);
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->m_scales,   coat_meta_bytes);
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->v_scales,   coat_meta_bytes);
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->m_kfactors, coat_meta_bytes);
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->v_kfactors, coat_meta_bytes);
-#endif
+    if (!model->coat_optim) {
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+        assert(model->m_memory == nullptr);
+        assert(model->v_memory == nullptr);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_memory, shard_num_parameters * sizeof(float));
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_memory, shard_num_parameters * sizeof(float));
+    } else {
+        // COAT FP8 layout: 1 byte/param for FP8 + 2 floats/group for (scale, k).
+        // Total overhead: ~1.0625 bytes/param vs 4 bytes/param for FP32 — ~3.76x reduction.
+        size_t coat_num_groups = CEIL_DIV(shard_num_parameters, COAT_GROUP_SIZE);
+        size_t coat_fp8_bytes  = shard_num_parameters * sizeof(uint8_t);
+        size_t coat_meta_bytes = coat_num_groups * sizeof(float);
+        printf0("allocating %zu MiB for COAT FP8 optimizer state m (fp8 + scales + kfactors)\n",
+                (coat_fp8_bytes + 2 * coat_meta_bytes) >> 20);
+        printf0("allocating %zu MiB for COAT FP8 optimizer state v (fp8 + scales + kfactors)\n",
+                (coat_fp8_bytes + 2 * coat_meta_bytes) >> 20);
+        assert(model->m_fp8 == nullptr && model->v_fp8 == nullptr);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_fp8,      coat_fp8_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_fp8,      coat_fp8_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_scales,   coat_meta_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_scales,   coat_meta_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_kfactors, coat_meta_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_kfactors, coat_meta_bytes);
+    }
 
     if (model->use_master_weights == 1) {
         assert(model->master_weights == nullptr);
@@ -2093,11 +2091,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // selectively weight decay some, but not all tensors :(
     // TODO: revisit and probably refactor this entire function
     NVTX_RANGE_FN();
-#ifndef COAT_OPTIM
-    if(model->grads_memory == nullptr || model->m_memory == nullptr || model->v_memory == nullptr) {
-#else
-    if(model->grads_memory == nullptr || model->m_fp8 == nullptr || model->v_fp8 == nullptr) {
-#endif
+    if(model->grads_memory == nullptr ||
+       (!model->coat_optim && (model->m_memory == nullptr || model->v_memory == nullptr)) ||
+       ( model->coat_optim && (model->m_fp8    == nullptr || model->v_fp8    == nullptr))) {
         fprintf(stderr, "Need to allocate optimizer state before update");
         exit(EXIT_FAILURE);
     }
@@ -2106,18 +2102,18 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     if(init_state) {
         model->init_state = false;
         NvtxRange rng("InitOpt");
-#ifndef COAT_OPTIM
-        cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
-#else
-        size_t _ng = CEIL_DIV(multi_gpu_config->shard_num_parameters, COAT_GROUP_SIZE);
-        cudaCheck(cudaMemset(model->m_fp8,      0, multi_gpu_config->shard_num_parameters * sizeof(uint8_t)));
-        cudaCheck(cudaMemset(model->v_fp8,      0, multi_gpu_config->shard_num_parameters * sizeof(uint8_t)));
-        cudaCheck(cudaMemset(model->m_scales,   0, _ng * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_scales,   0, _ng * sizeof(float)));
-        cudaCheck(cudaMemset(model->m_kfactors, 0, _ng * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_kfactors, 0, _ng * sizeof(float)));
-#endif
+        if (!model->coat_optim) {
+            cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
+            cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
+        } else {
+            size_t _ng = CEIL_DIV(multi_gpu_config->shard_num_parameters, COAT_GROUP_SIZE);
+            cudaCheck(cudaMemset(model->m_fp8,      0, multi_gpu_config->shard_num_parameters * sizeof(uint8_t)));
+            cudaCheck(cudaMemset(model->v_fp8,      0, multi_gpu_config->shard_num_parameters * sizeof(uint8_t)));
+            cudaCheck(cudaMemset(model->m_scales,   0, _ng * sizeof(float)));
+            cudaCheck(cudaMemset(model->v_scales,   0, _ng * sizeof(float)));
+            cudaCheck(cudaMemset(model->m_kfactors, 0, _ng * sizeof(float)));
+            cudaCheck(cudaMemset(model->v_kfactors, 0, _ng * sizeof(float)));
+        }
     }
 
     // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
@@ -2155,16 +2151,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
         ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ? local_offset_full : local_offset_partial;
-#ifndef COAT_OPTIM
-        float* m_ptr = model->m_memory + opt_state_offset;
-        float* v_ptr = model->v_memory + opt_state_offset;
-#else
-        // Phase 3 will supply FP8-aware m/v pointers here.
-        // For Phase 2 (layout only), set to nullptr so the compiler accepts the code;
-        // the adamw_update calls below are guarded and will not execute.
-        float* m_ptr = nullptr;
-        float* v_ptr = nullptr;
-#endif
+        float* m_ptr = model->coat_optim ? nullptr : model->m_memory + opt_state_offset;
+        float* v_ptr = model->coat_optim ? nullptr : model->v_memory + opt_state_offset;
         float* master_ptr = nullptr;
         if (model->master_weights != nullptr) { master_ptr = model->master_weights + opt_state_offset; }
 
@@ -2183,13 +2171,12 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             }
             if (init_from_master_only) {
                 init_from_master(param_ptr, master_ptr, shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
-            } else {
-#ifndef COAT_OPTIM
+            } else if (!model->coat_optim) {
                 adamw_update(param_ptr, master_ptr, grad_ptr,
                              m_ptr, v_ptr,
                              shard.size, tensor.size, tensor.size, shard.size, num_layers,
                              learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
-#else
+            } else {
                 adamw_update_coat(param_ptr, master_ptr, grad_ptr,
                                   model->m_fp8      + opt_state_offset,
                                   model->v_fp8      + opt_state_offset,
@@ -2199,7 +2186,6 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                   model->v_kfactors + opt_state_offset / COAT_GROUP_SIZE,
                                   shard.size, tensor.size, tensor.size, shard.size, num_layers,
                                   learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
-#endif
             }
         } else {
             // ----------------------------------------------------------------
@@ -2231,14 +2217,14 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                 if (!init_from_master_only) {
                     // AdamW: sd is the param (for weight decay reads); master_ptr gets the FP32 update;
                     // sd also receives the stochastic-rounded floatX output (we discard it below).
-#ifndef COAT_OPTIM
+                    if (!model->coat_optim) {
                     adamw_update(sd, layer_master_ptr, layer_grad_ptr,
                                  m_ptr + l * (ptrdiff_t)layer_elems,
                                  v_ptr + l * (ptrdiff_t)layer_elems,
                                  layer_elems, layer_elems, layer_elems, layer_elems, 1,
                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale,
                                  seed + (unsigned int)l, main_stream);
-#else
+                    } else {
                     ptrdiff_t layer_fp8_offset  = opt_state_offset + l * (ptrdiff_t)layer_elems;
                     ptrdiff_t layer_meta_offset = layer_fp8_offset / COAT_GROUP_SIZE;
                     adamw_update_coat(sd, layer_master_ptr, layer_grad_ptr,
@@ -2251,7 +2237,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                       layer_elems, layer_elems, layer_elems, layer_elems, 1,
                                       learning_rate, beta1, beta2, t, eps, wd, grad_scale,
                                       seed + (unsigned int)l, main_stream);
-#endif
+                    }
                     // Re-quantize from master_weights (FP32) → qvalues/scales.
                     // This is more accurate than quantizing from the stochastic-rounded floatX in sd.
                     const float* src = layer_master_ptr ? layer_master_ptr : nullptr;
@@ -2342,17 +2328,14 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->row_maxes_scratch);
     cudaFreeCheck(&model->params_memory);
     cudaFreeCheck(&model->grads_memory);
-#ifndef COAT_OPTIM
     cudaFreeCheck(&model->m_memory);
     cudaFreeCheck(&model->v_memory);
-#else
     cudaFreeCheck(&model->m_fp8);
     cudaFreeCheck(&model->v_fp8);
     cudaFreeCheck(&model->m_scales);
     cudaFreeCheck(&model->v_scales);
     cudaFreeCheck(&model->m_kfactors);
     cudaFreeCheck(&model->v_kfactors);
-#endif
     cudaFreeCheck(&model->master_weights);
     cudaFreeCheck(&model->acts_memory);
     cudaFreeCheck(&model->inputs);
@@ -2427,18 +2410,18 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
 
     // write AdamW optimizer state and master_weights
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
-#ifndef COAT_OPTIM
-    device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-#else
-    size_t _ng = CEIL_DIV(shard_num_parameters, COAT_GROUP_SIZE);
-    device_to_file(state_file, model->m_fp8,      shard_num_parameters * sizeof(uint8_t), IO_BUF_SIZE, main_stream);
-    device_to_file(state_file, model->v_fp8,      shard_num_parameters * sizeof(uint8_t), IO_BUF_SIZE, main_stream);
-    device_to_file(state_file, model->m_scales,   _ng * sizeof(float), IO_BUF_SIZE, main_stream);
-    device_to_file(state_file, model->v_scales,   _ng * sizeof(float), IO_BUF_SIZE, main_stream);
-    device_to_file(state_file, model->m_kfactors, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
-    device_to_file(state_file, model->v_kfactors, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
-#endif
+    if (!model->coat_optim) {
+        device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    } else {
+        size_t _ng = CEIL_DIV(shard_num_parameters, COAT_GROUP_SIZE);
+        device_to_file(state_file, model->m_fp8,      shard_num_parameters * sizeof(uint8_t), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_fp8,      shard_num_parameters * sizeof(uint8_t), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->m_scales,   _ng * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_scales,   _ng * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->m_kfactors, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_kfactors, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
+    }
     if(model->use_master_weights) {
         device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     }
@@ -2480,21 +2463,21 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     }
 
     model->init_state = false;      // we just got the state from file, no need to do first-touch init
-#ifndef COAT_OPTIM
-    assert(model->m_memory != nullptr);
-    assert(model->v_memory != nullptr);
-    file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-#else
-    size_t _ng = CEIL_DIV(shard_num_parameters, COAT_GROUP_SIZE);
-    assert(model->m_fp8 != nullptr && model->v_fp8 != nullptr);
-    file_to_device(model->m_fp8,      state_file, shard_num_parameters * sizeof(uint8_t), IO_BUF_SIZE, main_stream);
-    file_to_device(model->v_fp8,      state_file, shard_num_parameters * sizeof(uint8_t), IO_BUF_SIZE, main_stream);
-    file_to_device(model->m_scales,   state_file, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
-    file_to_device(model->v_scales,   state_file, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
-    file_to_device(model->m_kfactors, state_file, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
-    file_to_device(model->v_kfactors, state_file, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
-#endif
+    if (!model->coat_optim) {
+        assert(model->m_memory != nullptr);
+        assert(model->v_memory != nullptr);
+        file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    } else {
+        size_t _ng = CEIL_DIV(shard_num_parameters, COAT_GROUP_SIZE);
+        assert(model->m_fp8 != nullptr && model->v_fp8 != nullptr);
+        file_to_device(model->m_fp8,      state_file, shard_num_parameters * sizeof(uint8_t), IO_BUF_SIZE, main_stream);
+        file_to_device(model->v_fp8,      state_file, shard_num_parameters * sizeof(uint8_t), IO_BUF_SIZE, main_stream);
+        file_to_device(model->m_scales,   state_file, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
+        file_to_device(model->v_scales,   state_file, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
+        file_to_device(model->m_kfactors, state_file, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
+        file_to_device(model->v_kfactors, state_file, _ng * sizeof(float), IO_BUF_SIZE, main_stream);
+    }
     if(model->use_master_weights) {
         assert(model->master_weights != nullptr);
         file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
@@ -2626,6 +2609,7 @@ void error_usage() {
     fprintf(stderr, "  --ptq_precision <str> PTQ precision for quantized weights: int8|fp8|int4 (default = int8)\n");
     fprintf(stderr, "  --ptq_group_size <int> group size along cols for group-wise int4 quantization\n");
     fprintf(stderr, "                         (default = 128 when precision=int4, 0 = per-row otherwise)\n");
+    fprintf(stderr, "  --coat_optim <0|1>    use COAT FP8 optimizer state compression (default = 0)\n");
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
     fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
@@ -2674,6 +2658,7 @@ int main(int argc, char *argv[]) {
     int ptq_enabled = 0;
     const char* ptq_precision_name = "int8";
     int ptq_group_size = -1; // -1 = unset; resolved after we know the precision
+    int coat_optim = 0;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -2686,6 +2671,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--ptq") == 0) { ptq_enabled = atoi(argv[i+1]); continue; }
         if (strcmp(argv[i], "--ptq_precision") == 0) { ptq_precision_name = argv[i+1]; continue; }
         if (strcmp(argv[i], "--ptq_group_size") == 0) { ptq_group_size = atoi(argv[i+1]); continue; }
+        if (strcmp(argv[i], "--coat_optim") == 0) { coat_optim = atoi(argv[i+1]); continue; }
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
         // read in the args
@@ -2785,6 +2771,7 @@ int main(int argc, char *argv[]) {
     printf0("| ptq enabled           | %-50s |\n", ptq_enabled ? "yes" : "no");
     printf0("| ptq precision         | %-50s |\n", ptq_enabled ? ptq_precision_name : "n/a");
     printf0("| ptq group_size (req)  | %-50d |\n", ptq_enabled ? ptq_group_size : 0);
+    printf0("| coat_optim            | %-50s |\n", coat_optim ? "yes (FP8 optimizer states)" : "no (FP32)");
     printf0("+-----------------------+----------------------------------------------------+\n");
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
@@ -2827,6 +2814,7 @@ int main(int argc, char *argv[]) {
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
     model.ptq_enabled = ptq_enabled;
+    model.coat_optim = coat_optim;
     model.ptq_precision = ptq_enabled ? ptq_precision_from_string(ptq_precision_name) : PTQ_PRECISION_NONE;
     // ptq_group_size has already been resolved above (default 128 for int4, 0 per-row otherwise).
     model.ptq_group_size = ptq_group_size;

@@ -102,7 +102,6 @@ void init_from_master(Tp* params_memory, float* master_params_memory, size_t num
 // One CUDA block per group of COAT_GROUP_SIZE parameters.
 // Each thread handles one parameter: dequantize → AdamW math → group reduce → requantize.
 // ----------------------------------------------------------------------------
-#ifdef COAT_OPTIM
 #include "coat_fp8_optim.cuh"
 
 // Compute group k and scale from the group's max and min absolute values.
@@ -289,4 +288,3 @@ void adamw_update_coat(
     );
     cudaCheck(cudaGetLastError());
 }
-#endif // COAT_OPTIM
