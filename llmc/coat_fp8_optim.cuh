@@ -127,7 +127,7 @@ __host__ __device__ inline void coat_quantize_group(
         k = fminf(k, k_limit);
     }
 
-    float max_expanded = powf(max_abs, k);      // largest value after expansion
+    float max_expanded = coat_expand(max_abs, k);  // reuse k==1 short-circuit to avoid powf rounding
     float scale        = COAT_FP8_MAX / max_expanded;  // maps max_expanded -> 448
 
     // Pass 2: expand, scale, clamp, encode.
