@@ -88,7 +88,8 @@ float* float_cpu_malloc_and_point_parameters(FloatParameterTensors* params, size
     return params_memory;
 }
 
-int check_ptq_roundtrip(PTQPrecision precision, float max_abs_threshold, float mean_abs_threshold,
+int check_ptq_roundtrip(PTQPrecision precision, int group_size,
+                        float max_abs_threshold, float mean_abs_threshold,
                         float max_rel_threshold, float rel_epsilon) {
     const int rows = 2;
     const int cols = 8;
@@ -96,11 +97,12 @@ int check_ptq_roundtrip(PTQPrecision precision, float max_abs_threshold, float m
         -1.25f, -0.75f, -0.125f, -0.03125f, 0.0f, 0.0625f, 0.5f, 1.0f,
          0.001f, -0.002f, 0.01f, -0.02f, 0.25f, -0.5f, 3.0f, -6.0f,
     };
+    const int num_groups = ptq_num_groups(cols, group_size);
     uint8_t quantized[rows * cols];
-    float scales[rows];
+    float scales[rows * num_groups];
     float restored[rows * cols];
-    ptq_quantize_rows_host(quantized, scales, source, rows, cols, precision);
-    ptq_dequantize_rows_host(restored, quantized, scales, rows, cols, precision);
+    ptq_quantize_rows_host(quantized, scales, source, rows, cols, group_size, precision);
+    ptq_dequantize_rows_host(restored, quantized, scales, rows, cols, group_size, precision);
 
     float max_abs = 0.0f;
     float mean_abs = 0.0f;
@@ -119,8 +121,9 @@ int check_ptq_roundtrip(PTQPrecision precision, float max_abs_threshold, float m
     mean_abs /= (rows * cols);
     const int ok = max_abs <= max_abs_threshold && mean_abs <= mean_abs_threshold &&
                    (rel_count == 0 || max_rel <= max_rel_threshold);
-    printf("PTQ %s roundtrip: max_abs=%f mean_abs=%f max_rel=%f (|x|>%g) => %s\n",
-           ptq_precision_to_string(precision), max_abs, mean_abs, max_rel, rel_epsilon,
+    printf("PTQ %s (group_size=%d) roundtrip: max_abs=%f mean_abs=%f max_rel=%f (|x|>%g) => %s\n",
+           ptq_precision_to_string(precision), group_size,
+           max_abs, mean_abs, max_rel, rel_epsilon,
            ok ? "OK" : "NOT OK");
     return ok;
 }
@@ -303,9 +306,15 @@ int main(int argc, char *argv[]) {
     printf("OK (LOGITS)\n");
     printf("logit max diff: %f\n", max_diff);
 
-    allok &= check_ptq_roundtrip(PTQ_PRECISION_INT8, 0.03f, 0.01f, 0.20f, 1e-2f);
-    allok &= check_ptq_roundtrip(PTQ_PRECISION_FP8, 3.00f, 0.35f, 0.75f, 1e-2f);
-    allok &= check_ptq_roundtrip(PTQ_PRECISION_INT4, 0.45f, 0.15f, 1.00f, 1e-1f);
+    // Per-row roundtrips (group_size = cols = 8) keep the existing thresholds.
+    allok &= check_ptq_roundtrip(PTQ_PRECISION_INT8, 8, 0.03f, 0.01f, 0.20f, 1e-2f);
+    allok &= check_ptq_roundtrip(PTQ_PRECISION_FP8,  8, 3.00f, 0.35f, 0.75f, 1e-2f);
+    allok &= check_ptq_roundtrip(PTQ_PRECISION_INT4, 8, 0.45f, 0.15f, 1.00f, 1e-1f);
+    // Group-wise int4 roundtrip (group_size = 4 splits each 8-col row in two). The big
+    // outlier (-6.0) is still in a group of its own with 0.25 and -0.5, so per-element
+    // worst-case is unchanged; what improves is the small-magnitude row 1 group, which
+    // no longer collapses to zero. Tighter mean_abs threshold reflects that win.
+    allok &= check_ptq_roundtrip(PTQ_PRECISION_INT4, 4, 0.45f, 0.10f, 1.00f, 1e-1f);
     allok &= check_ptq_forward_regression(&model, x, y, B, T, logits_cpu, V, Vp);
 
     // let's do 10 training iterations, following the pytorch code
