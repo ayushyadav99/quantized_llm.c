@@ -2189,7 +2189,17 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                              m_ptr, v_ptr,
                              shard.size, tensor.size, tensor.size, shard.size, num_layers,
                              learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
-#endif // COAT_OPTIM: Phase 3 will insert the FP8 adamw_update call here
+#else
+                adamw_update_coat(param_ptr, master_ptr, grad_ptr,
+                                  model->m_fp8      + opt_state_offset,
+                                  model->v_fp8      + opt_state_offset,
+                                  model->m_scales   + opt_state_offset / COAT_GROUP_SIZE,
+                                  model->v_scales   + opt_state_offset / COAT_GROUP_SIZE,
+                                  model->m_kfactors + opt_state_offset / COAT_GROUP_SIZE,
+                                  model->v_kfactors + opt_state_offset / COAT_GROUP_SIZE,
+                                  shard.size, tensor.size, tensor.size, shard.size, num_layers,
+                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+#endif
             }
         } else {
             // ----------------------------------------------------------------
@@ -2228,7 +2238,20 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                  layer_elems, layer_elems, layer_elems, layer_elems, 1,
                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale,
                                  seed + (unsigned int)l, main_stream);
-#endif // COAT_OPTIM: Phase 3 will insert the FP8 adamw_update call here
+#else
+                    ptrdiff_t layer_fp8_offset  = opt_state_offset + l * (ptrdiff_t)layer_elems;
+                    ptrdiff_t layer_meta_offset = layer_fp8_offset / COAT_GROUP_SIZE;
+                    adamw_update_coat(sd, layer_master_ptr, layer_grad_ptr,
+                                      model->m_fp8      + layer_fp8_offset,
+                                      model->v_fp8      + layer_fp8_offset,
+                                      model->m_scales   + layer_meta_offset,
+                                      model->v_scales   + layer_meta_offset,
+                                      model->m_kfactors + layer_meta_offset,
+                                      model->v_kfactors + layer_meta_offset,
+                                      layer_elems, layer_elems, layer_elems, layer_elems, 1,
+                                      learning_rate, beta1, beta2, t, eps, wd, grad_scale,
+                                      seed + (unsigned int)l, main_stream);
+#endif
                     // Re-quantize from master_weights (FP32) → qvalues/scales.
                     // This is more accurate than quantizing from the stochastic-rounded floatX in sd.
                     const float* src = layer_master_ptr ? layer_master_ptr : nullptr;
