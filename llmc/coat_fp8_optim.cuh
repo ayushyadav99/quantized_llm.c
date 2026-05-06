@@ -53,7 +53,9 @@ __host__ __device__ inline float coat_unexpand(float x, float k) {
 // ratio is R_actual = max(|x|) / min(|x|, x≠0).
 // Derivation: we want R_actual^k = R_fp8, so k = ln(R_fp8) / ln(R_actual).
 __host__ __device__ inline float coat_compute_k(float R_actual) {
-    if (R_actual <= 1.0f) return COAT_K_MAX;  // flat group: max expansion
+    // When R_actual <= 1, all values have the same magnitude — no range variation to
+    // exploit. Expansion (k>1) only adds powf rounding noise. Use k=1 (identity).
+    if (R_actual <= 1.0f) return COAT_K_MIN;
     float k = COAT_FP8_LOG_RANGE / logf(R_actual);
     return fminf(fmaxf(k, COAT_K_MIN), COAT_K_MAX);
 }
