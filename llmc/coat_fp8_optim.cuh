@@ -39,14 +39,15 @@ static constexpr float COAT_K_MAX = 15.0f;
 
 // f(x) = sign(x) * |x|^k
 // Stretches a peaked distribution to fill FP8's dynamic range.
+// k=1 short-circuit avoids powf(x,1) rounding noise (powf uses exp(log(x)) internally).
 __host__ __device__ inline float coat_expand(float x, float k) {
-    return copysignf(powf(fabsf(x), k), x);
+    return (k == 1.0f) ? x : copysignf(powf(fabsf(x), k), x);
 }
 
 // f^{-1}(x) = sign(x) * |x|^{1/k}
 // Recovers the original value after dequantization.
 __host__ __device__ inline float coat_unexpand(float x, float k) {
-    return copysignf(powf(fabsf(x), 1.0f / k), x);
+    return (k == 1.0f) ? x : copysignf(powf(fabsf(x), 1.0f / k), x);
 }
 
 // Compute the expansion exponent k for a group whose actual dynamic range
