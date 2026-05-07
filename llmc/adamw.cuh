@@ -335,7 +335,12 @@ __global__ void adamw_kernel3_int8(
     if (in_bounds) {
         float sc_m = m_scales[group_idx], sc_v = v_scales[group_idx];
         if (sc_m > 0.0f) m = (float)((int8_t)m_q8[param_idx]) * sc_m;
-        if (sc_v > 0.0f) v = (float)((int8_t)v_q8[param_idx]) * sc_v;
+        if (sc_v > 0.0f) {
+            int8_t qv = (int8_t)v_q8[param_idx];
+            // If v quantized to 0 but scale is nonzero, floor at half a quant step
+            // to prevent 1/sqrt(0) explosion in the Adam update denominator.
+            v = (qv != 0) ? (float)qv * sc_v : sc_v * 0.5f;
+        }
     }
 
     // 2. AdamW math in FP32
@@ -464,8 +469,11 @@ __global__ void adamw_kernel3_int4(
         int    nibble_shift = (local_idx & 1) ? 4 : 0;
         if (sc_m > 0.0f)
             m = (float)optim_decode_int4((m_int4[byte_idx] >> nibble_shift) & 0x0Fu) * sc_m;
-        if (sc_v > 0.0f)
-            v = (float)optim_decode_int4((v_int4[byte_idx] >> nibble_shift) & 0x0Fu) * sc_v;
+        if (sc_v > 0.0f) {
+            int qv = optim_decode_int4((v_int4[byte_idx] >> nibble_shift) & 0x0Fu);
+            // Floor at half a quant step when v rounded to 0, same as INT8.
+            v = (qv != 0) ? (float)qv * sc_v : sc_v * 0.5f;
+        }
     }
 
     // 2. AdamW math in FP32
