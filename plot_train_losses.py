@@ -8,8 +8,8 @@ from xml.sax.saxutils import escape
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Plot train_losses.csv emitted by train_gpt2cu.")
-    parser.add_argument("loss_dump", help="Path to train_losses.csv, or an output log directory containing it.")
-    parser.add_argument("-o", "--output", help="Output SVG path. Defaults to loss_plot.svg next to the dump.")
+    parser.add_argument("loss_dump", nargs="+", help="One or more train_losses.csv files or log directories.")
+    parser.add_argument("-o", "--output", help="Output SVG path. Defaults to loss_plot.svg next to the first dump.")
     parser.add_argument("--smooth", type=int, default=1, help="Moving-average window for an extra smoothed curve.")
     parser.add_argument("--all-logs", action="store_true", help="When loss_dump is a directory, plot all train_losses*.csv files in it.")
     parser.add_argument("--title", default="Training loss", help="Plot title.")
@@ -241,18 +241,23 @@ def write_single_svg(path, steps, losses, smooth_window, title):
 
 def main():
     args = parse_args()
-    loss_dumps = resolve_loss_dumps(args.loss_dump, args.all_logs)
+
+    # Expand each argument: a directory resolves to its CSV(s), a file is used directly.
+    loss_dumps = []
+    for dump in args.loss_dump:
+        loss_dumps.extend(resolve_loss_dumps(dump, args.all_logs))
+
     missing = [path for path in loss_dumps if not path.exists()]
     if missing:
         raise SystemExit(f"Loss dump not found: {missing[0]}")
     if not loss_dumps:
         raise SystemExit(f"No train_losses*.csv files found in {args.loss_dump}")
 
-    input_path = Path(args.loss_dump)
+    first_path = Path(args.loss_dump[0])
     if args.output:
         output = Path(args.output)
-    elif input_path.is_dir():
-        output = input_path / ("loss_plot_all.svg" if args.all_logs else "loss_plot.svg")
+    elif first_path.is_dir():
+        output = first_path / ("loss_plot_all.svg" if args.all_logs else "loss_plot.svg")
     else:
         output = loss_dumps[0].with_name("loss_plot.svg")
 
