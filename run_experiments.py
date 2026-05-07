@@ -8,6 +8,7 @@ import subprocess
 import sys
 import csv
 import math
+import os
 import re
 import shutil
 import tempfile
@@ -225,6 +226,16 @@ def write_svg(output_path, series, smooth_window, loss_label):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def ask(prompt, default=""):
+    """input() wrapper that handles EOF gracefully instead of crashing."""
+    try:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        return input().strip()
+    except EOFError:
+        return default
+
+
 def main():
     print("=" * 56)
     print("  Experiment Runner")
@@ -237,8 +248,7 @@ def main():
 
     while True:
         exp_num += 1
-        print(f"[Experiment {exp_num}] Command (or 'done'):")
-        cmd = input("  > ").strip()
+        cmd = ask(f"[Experiment {exp_num}] Command (or 'done'):\n  > ")
 
         if cmd.lower() in ("done", "no", "n", "quit", "exit", ""):
             if not experiments:
@@ -251,15 +261,21 @@ def main():
 
         print(f"\n  Running: {run_cmd}\n" + "-" * 56)
         try:
-            result = subprocess.run(run_cmd, shell=True)
+            # stdin=None inherits terminal so training output is live;
+            # the training binary does not read stdin so this is safe.
+            result = subprocess.run(run_cmd, shell=True, stdin=open(os.devnull))
         except KeyboardInterrupt:
             print("\n  Interrupted — skipping.")
             if is_temp: shutil.rmtree(log_dir, ignore_errors=True)
             exp_num -= 1
             continue
 
+        print("\n" + "=" * 56)
+        print("  TRAINING COMPLETE")
+        print("=" * 56)
+
         if result.returncode != 0:
-            print(f"  Exited {result.returncode} — skipping.")
+            print(f"  Command exited with code {result.returncode} — skipping.")
             if is_temp: shutil.rmtree(log_dir, ignore_errors=True)
             exp_num -= 1
             continue
@@ -273,30 +289,31 @@ def main():
         label = extract_label(cmd)
         experiments.append({"cmd": cmd, "label": label,
                              "csv": csv_path, "log_dir": log_dir, "is_temp": is_temp})
-        print(f"\n  Done. Label: '{label}'")
+        print(f"  Label: '{label}'")
 
-        print(f"\n  Add another? (Enter to continue, 'done' to finish):")
-        if input("  > ").strip().lower() in ("done", "no", "n", "quit", "exit"):
+        ans = ask("\n  Add another experiment? [y/n, default: n]: ")
+        if not ans.lower().startswith("y"):
             break
         print()
 
     # Ask train or val
     print("\n" + "=" * 56)
-    print("Which loss to plot?")
-    print("  [1] Training loss  ← default")
+    print("  Which loss to plot?")
+    print("  [1] Training loss  (default)")
     print("  [2] Validation loss")
-    choice = input("  > ").strip()
-    use_val    = choice == "2"
+    print("=" * 56)
+    choice = ask("  > ")
+    use_val    = choice.strip() == "2"
     loss_label = "validation loss" if use_val else "training loss"
 
-    # Load data — val loss lives in val_losses.csv, train loss in train_losses.csv
+    # Load data
     series = []
     for e in experiments:
         try:
             if use_val:
                 val_csv = e["log_dir"] / "val_losses.csv"
                 if not val_csv.exists():
-                    print(f"  Skipping '{e['label']}': val_losses.csv not found (rebuild needed)")
+                    print(f"  Skipping '{e['label']}': val_losses.csv not found — rebuild first")
                     continue
                 steps, losses = read_losses(val_csv, "val_loss")
             else:
@@ -309,12 +326,16 @@ def main():
         print("No valid data. Exiting.")
         sys.exit(1)
 
-    # Save to logs/comparison_graphs/
+    # Save
     COMPARISON_DIR.mkdir(parents=True, exist_ok=True)
     output = COMPARISON_DIR / f"comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.svg"
     write_svg(output, series, SMOOTH_WINDOW, loss_label)
-    print(f"\n  Plot saved to: {output.resolve()}")
-    print("  Open in a browser — hover over markers to see exact values.\n")
+
+    print("\n" + "=" * 56)
+    print(f"  Graph saved to:")
+    print(f"  {output.resolve()}")
+    print("  Open in a browser — hover markers to see exact values.")
+    print("=" * 56 + "\n")
 
     for e in experiments:
         if e["is_temp"]: shutil.rmtree(e["log_dir"], ignore_errors=True)
