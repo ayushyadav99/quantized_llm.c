@@ -30,7 +30,8 @@ def label_from_path(path):
     if label.startswith("train_losses_"):
         label = label[len("train_losses_"):]
     elif label == "train_losses":
-        label = "loss"
+        # Use the parent directory name (e.g. logs/fp8/train_losses.csv → "fp8")
+        label = path.parent.name if path.parent.name not in (".", "") else "loss"
     return label
 
 
