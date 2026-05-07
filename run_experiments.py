@@ -280,21 +280,27 @@ def main():
             break
         print()
 
-    # Always ask train vs val
+    # Ask train or val
     print("\n" + "=" * 56)
-    print("Plot training loss or validation loss?")
+    print("Which loss to plot?")
     print("  [1] Training loss  ← default")
     print("  [2] Validation loss")
     choice = input("  > ").strip()
     use_val    = choice == "2"
-    column     = "val_loss"        if use_val else "train_loss"
     loss_label = "validation loss" if use_val else "training loss"
 
-    # Load data
+    # Load data — val loss lives in val_losses.csv, train loss in train_losses.csv
     series = []
     for e in experiments:
         try:
-            steps, losses = read_losses(e["csv"], column)
+            if use_val:
+                val_csv = e["log_dir"] / "val_losses.csv"
+                if not val_csv.exists():
+                    print(f"  Skipping '{e['label']}': val_losses.csv not found (rebuild needed)")
+                    continue
+                steps, losses = read_losses(val_csv, "val_loss")
+            else:
+                steps, losses = read_losses(e["csv"], "train_loss")
             series.append({"label": e["label"], "steps": steps, "losses": losses})
         except SystemExit as ex:
             print(f"  Skipping '{e['label']}': {ex}")
