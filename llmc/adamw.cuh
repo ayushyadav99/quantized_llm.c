@@ -182,28 +182,27 @@ __global__ void adamw_kernel3_coat(
         if (master_params_memory) master_params_memory[param_idx] = param;
     }
 
-    // Shared memory for two sequential reductions (reused for m then v).
-    __shared__ float sm_max[COAT_GROUP_SIZE];
-    __shared__ float sm_min[COAT_GROUP_SIZE];
+    // Dynamic shared memory: [blockDim.x floats for max] [blockDim.x floats for min]
+    extern __shared__ float sm_coat_buf[];
+    float* sm_max = sm_coat_buf;
+    float* sm_min = sm_coat_buf + blockDim.x;
 
     // --- 3. Quantize updated m back to FP8 ---
     {
         float abs_m = in_bounds ? fabsf(m) : 0.0f;
 
-        // Max reduction across the group.
         sm_max[local_idx] = abs_m;
         __syncthreads();
-        for (int s = COAT_GROUP_SIZE / 2; s > 0; s >>= 1) {
+        for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1) {
             if (local_idx < s)
                 sm_max[local_idx] = fmaxf(sm_max[local_idx], sm_max[local_idx + s]);
             __syncthreads();
         }
         float max_m = sm_max[0];
 
-        // Min reduction (out-of-bounds and zero threads contribute the sentinel max_m).
         sm_min[local_idx] = (abs_m > 0.0f) ? abs_m : max_m;
         __syncthreads();
-        for (int s = COAT_GROUP_SIZE / 2; s > 0; s >>= 1) {
+        for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1) {
             if (local_idx < s)
                 sm_min[local_idx] = fminf(sm_min[local_idx], sm_min[local_idx + s]);
             __syncthreads();
@@ -223,7 +222,7 @@ __global__ void adamw_kernel3_coat(
             m_kfactors[group_idx] = new_k_m;
         }
     }
-    __syncthreads(); // free shared memory before reuse for v
+    __syncthreads();
 
     // --- 4. Quantize updated v back to FP8 (same pattern as m) ---
     {
@@ -231,7 +230,7 @@ __global__ void adamw_kernel3_coat(
 
         sm_max[local_idx] = abs_v;
         __syncthreads();
-        for (int s = COAT_GROUP_SIZE / 2; s > 0; s >>= 1) {
+        for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1) {
             if (local_idx < s)
                 sm_max[local_idx] = fmaxf(sm_max[local_idx], sm_max[local_idx + s]);
             __syncthreads();
@@ -240,7 +239,7 @@ __global__ void adamw_kernel3_coat(
 
         sm_min[local_idx] = (abs_v > 0.0f) ? abs_v : max_v;
         __syncthreads();
-        for (int s = COAT_GROUP_SIZE / 2; s > 0; s >>= 1) {
+        for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1) {
             if (local_idx < s)
                 sm_min[local_idx] = fminf(sm_min[local_idx], sm_min[local_idx + s]);
             __syncthreads();
@@ -271,17 +270,293 @@ void adamw_update_coat(
     float*   m_kfactors,    float*   v_kfactors,
     size_t   num_parameters,
     ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride, int num_slices,
+    int group_size,
     float learning_rate, float beta1, float beta2, int t,
     float eps, float weight_decay, float grad_scale, unsigned int seed,
     cudaStream_t stream
 ) {
-    size_t    num_groups   = CEIL_DIV(num_parameters, (size_t)COAT_GROUP_SIZE);
-    ptrdiff_t meta_stride  = (ptrdiff_t)CEIL_DIV(s_stride, COAT_GROUP_SIZE);
-    float     beta1_corr   = 1.0f - powf(beta1, t);
-    float     beta2_corr   = 1.0f - powf(beta2, t);
-    adamw_kernel3_coat<<<dim3(num_groups, num_slices), COAT_GROUP_SIZE, 0, stream>>>(
+    size_t    num_groups  = CEIL_DIV(num_parameters, (size_t)group_size);
+    ptrdiff_t meta_stride = (ptrdiff_t)CEIL_DIV(s_stride, group_size);
+    float     beta1_corr  = 1.0f - powf(beta1, t);
+    float     beta2_corr  = 1.0f - powf(beta2, t);
+    size_t    smem        = 2 * (size_t)group_size * sizeof(float); // sm_max + sm_min
+    adamw_kernel3_coat<<<dim3(num_groups, num_slices), group_size, smem, stream>>>(
         params_memory, master_params_memory, grads_memory,
         m_fp8, v_fp8, m_scales, v_scales, m_kfactors, v_kfactors,
+        num_parameters, w_stride, g_stride, s_stride, meta_stride,
+        learning_rate, beta1, beta2, beta1_corr, beta2_corr,
+        eps, weight_decay, grad_scale, seed
+    );
+    cudaCheck(cudaGetLastError());
+}
+
+// ----------------------------------------------------------------------------
+// INT8 optimizer state kernel
+// Identical block-per-group structure to COAT FP8, but uses plain absmax
+// scaling with signed INT8 (range [-127, 127]) — no k-factors needed.
+// ----------------------------------------------------------------------------
+
+// Inline nibble helpers so this file doesn't depend on train_gpt2.cu's ptq_*.
+__device__ inline int optim_decode_int4(uint8_t nibble) {
+    return (int)((int8_t)((nibble & 0x0Fu) << 4) >> 4);
+}
+__device__ inline uint8_t optim_pack_int4(int lo, int hi) {
+    return (uint8_t)((lo & 0x0F) | ((hi & 0x0F) << 4));
+}
+
+template <typename Tp, typename Tg>
+__global__ void adamw_kernel3_int8(
+    Tp*      params_memory,
+    float*   master_params_memory,
+    Tg*      grads_memory,
+    uint8_t* m_q8,    uint8_t* v_q8,
+    float*   m_scales, float*  v_scales,
+    size_t   num_parameters,
+    ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride, ptrdiff_t meta_stride,
+    float learning_rate, float beta1, float beta2,
+    float beta1_correction, float beta2_correction,
+    float eps, float weight_decay, float grad_scale, unsigned int seed
+) {
+    size_t group_idx = blockIdx.x;
+    int    local_idx = threadIdx.x;
+    size_t param_idx = group_idx * (size_t)blockDim.x + local_idx;
+    bool   in_bounds = (param_idx < num_parameters);
+
+    params_memory  += blockIdx.y * w_stride;
+    grads_memory   += blockIdx.y * g_stride;
+    m_q8           += blockIdx.y * s_stride;
+    v_q8           += blockIdx.y * s_stride;
+    m_scales       += blockIdx.y * meta_stride;
+    v_scales       += blockIdx.y * meta_stride;
+    if (master_params_memory) master_params_memory += blockIdx.y * s_stride;
+
+    // 1. Dequantize: scale==0 means uninitialised → treat as zero.
+    float m = 0.0f, v = 0.0f;
+    if (in_bounds) {
+        float sc_m = m_scales[group_idx], sc_v = v_scales[group_idx];
+        if (sc_m > 0.0f) m = (float)((int8_t)m_q8[param_idx]) * sc_m;
+        if (sc_v > 0.0f) v = (float)((int8_t)v_q8[param_idx]) * sc_v;
+    }
+
+    // 2. AdamW math in FP32
+    if (in_bounds) {
+        float grad = grad_scale * (float)grads_memory[param_idx];
+        m = lerp(grad, m, beta1);
+        v = lerp(grad * grad, v, beta2);
+        float m_hat = m / beta1_correction;
+        float v_hat = v / beta2_correction;
+        float old_param = master_params_memory ? master_params_memory[param_idx]
+                                               : (float)params_memory[param_idx];
+        float param = old_param - learning_rate *
+                      (m_hat / (sqrtf(v_hat) + eps) + weight_decay * old_param);
+        stochastic_rounding(param, &params_memory[param_idx], seed);
+        if (master_params_memory) master_params_memory[param_idx] = param;
+    }
+
+    // Shared memory for group-wide max reduction (dynamic, sized at launch).
+    extern __shared__ float sm_int8_max[];
+
+    // 3. Requantize m: reduce max(|m|) → new scale → store int8.
+    {
+        sm_int8_max[local_idx] = in_bounds ? fabsf(m) : 0.0f;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (local_idx < s)
+                sm_int8_max[local_idx] = fmaxf(sm_int8_max[local_idx], sm_int8_max[local_idx + s]);
+            __syncthreads();
+        }
+        float max_m = sm_int8_max[0];
+        float new_scale_m = (max_m > 0.0f) ? max_m / 127.0f : 1.0f;
+        if (in_bounds) {
+            int q = (int)lrintf(fmaxf(-127.0f, fminf(127.0f, m / new_scale_m)));
+            m_q8[param_idx] = (uint8_t)(int8_t)q;
+        }
+        if (local_idx == 0) m_scales[group_idx] = new_scale_m;
+    }
+    __syncthreads();
+
+    // 4. Requantize v (same pattern).
+    {
+        sm_int8_max[local_idx] = in_bounds ? fabsf(v) : 0.0f;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (local_idx < s)
+                sm_int8_max[local_idx] = fmaxf(sm_int8_max[local_idx], sm_int8_max[local_idx + s]);
+            __syncthreads();
+        }
+        float max_v = sm_int8_max[0];
+        float new_scale_v = (max_v > 0.0f) ? max_v / 127.0f : 1.0f;
+        if (in_bounds) {
+            int q = (int)lrintf(fmaxf(-127.0f, fminf(127.0f, v / new_scale_v)));
+            v_q8[param_idx] = (uint8_t)(int8_t)q;
+        }
+        if (local_idx == 0) v_scales[group_idx] = new_scale_v;
+    }
+}
+
+template <typename Tp, typename Tg>
+void adamw_update_int8(
+    Tp* params_memory, float* master_params_memory, Tg* grads_memory,
+    uint8_t* m_q8, uint8_t* v_q8,
+    float* m_scales, float* v_scales,
+    size_t num_parameters,
+    ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride, int num_slices,
+    int group_size,
+    float learning_rate, float beta1, float beta2, int t,
+    float eps, float weight_decay, float grad_scale, unsigned int seed,
+    cudaStream_t stream
+) {
+    size_t    num_groups  = CEIL_DIV(num_parameters, (size_t)group_size);
+    ptrdiff_t meta_stride = (ptrdiff_t)CEIL_DIV(s_stride, group_size);
+    float beta1_corr = 1.0f - powf(beta1, t);
+    float beta2_corr = 1.0f - powf(beta2, t);
+    size_t smem = (size_t)group_size * sizeof(float);
+    adamw_kernel3_int8<<<dim3(num_groups, num_slices), group_size, smem, stream>>>(
+        params_memory, master_params_memory, grads_memory,
+        m_q8, v_q8, m_scales, v_scales,
+        num_parameters, w_stride, g_stride, s_stride, meta_stride,
+        learning_rate, beta1, beta2, beta1_corr, beta2_corr,
+        eps, weight_decay, grad_scale, seed
+    );
+    cudaCheck(cudaGetLastError());
+}
+
+// ----------------------------------------------------------------------------
+// INT4 optimizer state kernel
+// Same block-per-group structure.  Two values per byte (nibble-packed).
+// group_size MUST be even and a power of two.
+// ----------------------------------------------------------------------------
+template <typename Tp, typename Tg>
+__global__ void adamw_kernel3_int4(
+    Tp*      params_memory,
+    float*   master_params_memory,
+    Tg*      grads_memory,
+    uint8_t* m_int4,  uint8_t* v_int4,   // nibble-packed; byte stride = s_stride/2
+    float*   m_scales, float*  v_scales,
+    size_t   num_parameters,
+    ptrdiff_t w_stride, ptrdiff_t g_stride,
+    ptrdiff_t s_stride,       // logical param stride (for master weights)
+    ptrdiff_t meta_stride,
+    float learning_rate, float beta1, float beta2,
+    float beta1_correction, float beta2_correction,
+    float eps, float weight_decay, float grad_scale, unsigned int seed
+) {
+    size_t group_idx = blockIdx.x;
+    int    local_idx = threadIdx.x;
+    size_t param_idx = group_idx * (size_t)blockDim.x + local_idx;
+    bool   in_bounds = (param_idx < num_parameters);
+
+    ptrdiff_t s_stride_bytes = (s_stride + 1) / 2;
+
+    params_memory  += blockIdx.y * w_stride;
+    grads_memory   += blockIdx.y * g_stride;
+    m_int4         += blockIdx.y * s_stride_bytes;
+    v_int4         += blockIdx.y * s_stride_bytes;
+    m_scales       += blockIdx.y * meta_stride;
+    v_scales       += blockIdx.y * meta_stride;
+    if (master_params_memory) master_params_memory += blockIdx.y * s_stride;
+
+    // 1. Dequantize INT4 nibbles → float m, v.
+    float m = 0.0f, v = 0.0f;
+    if (in_bounds) {
+        float sc_m = m_scales[group_idx], sc_v = v_scales[group_idx];
+        size_t byte_idx    = param_idx >> 1;
+        int    nibble_shift = (local_idx & 1) ? 4 : 0;
+        if (sc_m > 0.0f)
+            m = (float)optim_decode_int4((m_int4[byte_idx] >> nibble_shift) & 0x0Fu) * sc_m;
+        if (sc_v > 0.0f)
+            v = (float)optim_decode_int4((v_int4[byte_idx] >> nibble_shift) & 0x0Fu) * sc_v;
+    }
+
+    // 2. AdamW math in FP32
+    if (in_bounds) {
+        float grad = grad_scale * (float)grads_memory[param_idx];
+        m = lerp(grad, m, beta1);
+        v = lerp(grad * grad, v, beta2);
+        float m_hat = m / beta1_correction;
+        float v_hat = v / beta2_correction;
+        float old_param = master_params_memory ? master_params_memory[param_idx]
+                                               : (float)params_memory[param_idx];
+        float param = old_param - learning_rate *
+                      (m_hat / (sqrtf(v_hat) + eps) + weight_decay * old_param);
+        stochastic_rounding(param, &params_memory[param_idx], seed);
+        if (master_params_memory) master_params_memory[param_idx] = param;
+    }
+
+    // Shared mem layout: [group_size floats for max] [group_size int8 for quantized scratch]
+    extern __shared__ char sm_int4_buf[];
+    float*  sm_max = (float*)sm_int4_buf;
+    int8_t* sm_q   = (int8_t*)(sm_int4_buf + blockDim.x * sizeof(float));
+
+    // 3. Requantize m to INT4.
+    {
+        sm_max[local_idx] = in_bounds ? fabsf(m) : 0.0f;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (local_idx < s)
+                sm_max[local_idx] = fmaxf(sm_max[local_idx], sm_max[local_idx + s]);
+            __syncthreads();
+        }
+        float max_m = sm_max[0];
+        float new_scale_m = (max_m > 0.0f) ? max_m / 7.0f : 1.0f;
+        sm_q[local_idx] = in_bounds
+            ? (int8_t)lrintf(fmaxf(-7.0f, fminf(7.0f, m / new_scale_m))) : (int8_t)0;
+        __syncthreads();
+        if (in_bounds && (local_idx % 2 == 0)) {
+            int8_t lo = sm_q[local_idx];
+            int8_t hi = (local_idx + 1 < (int)blockDim.x && (param_idx + 1) < num_parameters)
+                        ? sm_q[local_idx + 1] : (int8_t)0;
+            m_int4[param_idx >> 1] = optim_pack_int4((int)lo, (int)hi);
+        }
+        if (local_idx == 0) m_scales[group_idx] = new_scale_m;
+    }
+    __syncthreads();
+
+    // 4. Requantize v to INT4 (same pattern).
+    {
+        sm_max[local_idx] = in_bounds ? fabsf(v) : 0.0f;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (local_idx < s)
+                sm_max[local_idx] = fmaxf(sm_max[local_idx], sm_max[local_idx + s]);
+            __syncthreads();
+        }
+        float max_v = sm_max[0];
+        float new_scale_v = (max_v > 0.0f) ? max_v / 7.0f : 1.0f;
+        sm_q[local_idx] = in_bounds
+            ? (int8_t)lrintf(fmaxf(-7.0f, fminf(7.0f, v / new_scale_v))) : (int8_t)0;
+        __syncthreads();
+        if (in_bounds && (local_idx % 2 == 0)) {
+            int8_t lo = sm_q[local_idx];
+            int8_t hi = (local_idx + 1 < (int)blockDim.x && (param_idx + 1) < num_parameters)
+                        ? sm_q[local_idx + 1] : (int8_t)0;
+            v_int4[param_idx >> 1] = optim_pack_int4((int)lo, (int)hi);
+        }
+        if (local_idx == 0) v_scales[group_idx] = new_scale_v;
+    }
+}
+
+template <typename Tp, typename Tg>
+void adamw_update_int4(
+    Tp* params_memory, float* master_params_memory, Tg* grads_memory,
+    uint8_t* m_int4, uint8_t* v_int4,
+    float* m_scales, float* v_scales,
+    size_t num_parameters,
+    ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride, int num_slices,
+    int group_size,
+    float learning_rate, float beta1, float beta2, int t,
+    float eps, float weight_decay, float grad_scale, unsigned int seed,
+    cudaStream_t stream
+) {
+    size_t    num_groups  = CEIL_DIV(num_parameters, (size_t)group_size);
+    ptrdiff_t meta_stride = (ptrdiff_t)CEIL_DIV(s_stride, group_size);
+    float beta1_corr = 1.0f - powf(beta1, t);
+    float beta2_corr = 1.0f - powf(beta2, t);
+    // Shared mem: group_size floats (max) + group_size int8 (quantized scratch).
+    size_t smem = (size_t)group_size * (sizeof(float) + sizeof(int8_t));
+    adamw_kernel3_int4<<<dim3(num_groups, num_slices), group_size, smem, stream>>>(
+        params_memory, master_params_memory, grads_memory,
+        m_int4, v_int4, m_scales, v_scales,
         num_parameters, w_stride, g_stride, s_stride, meta_stride,
         learning_rate, beta1, beta2, beta1_corr, beta2_corr,
         eps, weight_decay, grad_scale, seed
