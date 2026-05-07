@@ -841,7 +841,7 @@ typedef struct {
     uint8_t* v_qstate;
     float*   m_scales;    // absmax scale, one float per group
     float*   v_scales;
-    float*   m_kfactors;  // COAT FP8 only: expansion exponent k, one float per group
+    float*   m_kfactors;  // COAT expansion exponent k, one float per group (all quantized modes)
     float*   v_kfactors;
     float* master_weights;     // optional FP32 copy of params used for numerically safer updates
     // the activations of the model, and their sizes
@@ -1259,24 +1259,20 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
                               ? (shard_num_parameters + 1) / 2
                               : shard_num_parameters * sizeof(uint8_t);
         size_t meta_bytes   = num_groups * sizeof(float);
-        const char* mode_name[] = {"", "FP8(COAT)", "INT8", "INT4"};
-        printf0("allocating %zu MiB for %s optimizer state m (qstate + scales%s)\n",
-                (qstate_bytes + (model->optim_quant == 1 ? 2 : 1) * meta_bytes) >> 20,
-                mode_name[model->optim_quant],
-                model->optim_quant == 1 ? " + kfactors" : "");
-        printf0("allocating %zu MiB for %s optimizer state v (qstate + scales%s)\n",
-                (qstate_bytes + (model->optim_quant == 1 ? 2 : 1) * meta_bytes) >> 20,
-                mode_name[model->optim_quant],
-                model->optim_quant == 1 ? " + kfactors" : "");
+        // All quantized modes now use COAT-style k-factors for dynamic range expansion.
+        const char* mode_name[] = {"", "FP8(COAT)", "INT8(COAT)", "INT4(COAT)"};
+        printf0("allocating %zu MiB for %s optimizer state m (qstate + scales + kfactors)\n",
+                (qstate_bytes + 2 * meta_bytes) >> 20, mode_name[model->optim_quant]);
+        printf0("allocating %zu MiB for %s optimizer state v (qstate + scales + kfactors)\n",
+                (qstate_bytes + 2 * meta_bytes) >> 20, mode_name[model->optim_quant]);
         assert(model->m_qstate == nullptr && model->v_qstate == nullptr);
-        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_qstate,  qstate_bytes);
-        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_qstate,  qstate_bytes);
-        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_scales,  meta_bytes);
-        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_scales,  meta_bytes);
-        if (model->optim_quant == 1) { // COAT FP8 also needs k-factors
-            memory_status |= cudaMallocConditionallyManaged((void**)&model->m_kfactors, meta_bytes);
-            memory_status |= cudaMallocConditionallyManaged((void**)&model->v_kfactors, meta_bytes);
-        }
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_qstate,    qstate_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_qstate,    qstate_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_scales,    meta_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_scales,    meta_bytes);
+        // All modes need k-factors (INT8 and INT4 use COAT expansion like FP8).
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_kfactors,  meta_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_kfactors,  meta_bytes);
     }
 
     if (model->use_master_weights == 1) {
@@ -2127,12 +2123,11 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             size_t qstate_bytes = (model->optim_quant == 3) ? (np + 1) / 2 : np * sizeof(uint8_t);
             cudaCheck(cudaMemset(model->m_qstate, 0, qstate_bytes));
             cudaCheck(cudaMemset(model->v_qstate, 0, qstate_bytes));
-            cudaCheck(cudaMemset(model->m_scales, 0, num_groups * sizeof(float)));
-            cudaCheck(cudaMemset(model->v_scales, 0, num_groups * sizeof(float)));
-            if (model->optim_quant == 1) { // COAT FP8 k-factors
-                cudaCheck(cudaMemset(model->m_kfactors, 0, num_groups * sizeof(float)));
-                cudaCheck(cudaMemset(model->v_kfactors, 0, num_groups * sizeof(float)));
-            }
+            cudaCheck(cudaMemset(model->m_scales,   0, num_groups * sizeof(float)));
+            cudaCheck(cudaMemset(model->v_scales,   0, num_groups * sizeof(float)));
+            // All quantized modes use COAT k-factors now.
+            cudaCheck(cudaMemset(model->m_kfactors, 0, num_groups * sizeof(float)));
+            cudaCheck(cudaMemset(model->v_kfactors, 0, num_groups * sizeof(float)));
         }
     }
 
@@ -2210,18 +2205,22 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                   learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
             } else if (oq == 2) {
                 adamw_update_int8(param_ptr, master_ptr, grad_ptr,
-                                  model->m_qstate + opt_state_offset,
-                                  model->v_qstate + opt_state_offset,
-                                  model->m_scales + opt_state_offset / ogs,
-                                  model->v_scales + opt_state_offset / ogs,
+                                  model->m_qstate   + opt_state_offset,
+                                  model->v_qstate   + opt_state_offset,
+                                  model->m_scales   + opt_state_offset / ogs,
+                                  model->v_scales   + opt_state_offset / ogs,
+                                  model->m_kfactors + opt_state_offset / ogs,
+                                  model->v_kfactors + opt_state_offset / ogs,
                                   shard.size, tensor.size, tensor.size, shard.size, num_layers, ogs,
                                   learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
             } else { // INT4
                 adamw_update_int4(param_ptr, master_ptr, grad_ptr,
-                                  model->m_qstate + opt_state_offset / 2,
-                                  model->v_qstate + opt_state_offset / 2,
-                                  model->m_scales + opt_state_offset / ogs,
-                                  model->v_scales + opt_state_offset / ogs,
+                                  model->m_qstate   + opt_state_offset / 2,
+                                  model->v_qstate   + opt_state_offset / 2,
+                                  model->m_scales   + opt_state_offset / ogs,
+                                  model->v_scales   + opt_state_offset / ogs,
+                                  model->m_kfactors + opt_state_offset / ogs,
+                                  model->v_kfactors + opt_state_offset / ogs,
                                   shard.size, tensor.size, tensor.size, shard.size, num_layers, ogs,
                                   learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
             }
@@ -2277,19 +2276,23 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                           seed + (unsigned int)l, main_stream);
                     } else if (oq == 2) {
                         adamw_update_int8(sd, layer_master_ptr, layer_grad_ptr,
-                                          model->m_qstate + layer_param_offset,
-                                          model->v_qstate + layer_param_offset,
-                                          model->m_scales + layer_meta_offset,
-                                          model->v_scales + layer_meta_offset,
+                                          model->m_qstate   + layer_param_offset,
+                                          model->v_qstate   + layer_param_offset,
+                                          model->m_scales   + layer_meta_offset,
+                                          model->v_scales   + layer_meta_offset,
+                                          model->m_kfactors + layer_meta_offset,
+                                          model->v_kfactors + layer_meta_offset,
                                           layer_elems, layer_elems, layer_elems, layer_elems, 1, ogs,
                                           learning_rate, beta1, beta2, t, eps, wd, grad_scale,
                                           seed + (unsigned int)l, main_stream);
                     } else { // INT4
                         adamw_update_int4(sd, layer_master_ptr, layer_grad_ptr,
-                                          model->m_qstate + layer_param_offset / 2,
-                                          model->v_qstate + layer_param_offset / 2,
-                                          model->m_scales + layer_meta_offset,
-                                          model->v_scales + layer_meta_offset,
+                                          model->m_qstate   + layer_param_offset / 2,
+                                          model->v_qstate   + layer_param_offset / 2,
+                                          model->m_scales   + layer_meta_offset,
+                                          model->v_scales   + layer_meta_offset,
+                                          model->m_kfactors + layer_meta_offset,
+                                          model->v_kfactors + layer_meta_offset,
                                           layer_elems, layer_elems, layer_elems, layer_elems, 1, ogs,
                                           learning_rate, beta1, beta2, t, eps, wd, grad_scale,
                                           seed + (unsigned int)l, main_stream);
@@ -2477,12 +2480,11 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
                               : shard_num_parameters * sizeof(uint8_t);
         device_to_file(state_file, model->m_qstate, qstate_bytes, IO_BUF_SIZE, main_stream);
         device_to_file(state_file, model->v_qstate, qstate_bytes, IO_BUF_SIZE, main_stream);
-        device_to_file(state_file, model->m_scales, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
-        device_to_file(state_file, model->v_scales, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
-        if (model->optim_quant == 1) {
-            device_to_file(state_file, model->m_kfactors, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
-            device_to_file(state_file, model->v_kfactors, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
-        }
+        device_to_file(state_file, model->m_scales,   num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_scales,   num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        // All quantized modes save k-factors (all use COAT-style expansion now).
+        device_to_file(state_file, model->m_kfactors, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_kfactors, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
     }
     if(model->use_master_weights) {
         device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
@@ -2538,12 +2540,11 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         assert(model->m_qstate != nullptr && model->v_qstate != nullptr);
         file_to_device(model->m_qstate, state_file, qstate_bytes, IO_BUF_SIZE, main_stream);
         file_to_device(model->v_qstate, state_file, qstate_bytes, IO_BUF_SIZE, main_stream);
-        file_to_device(model->m_scales, state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
-        file_to_device(model->v_scales, state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
-        if (model->optim_quant == 1) {
-            file_to_device(model->m_kfactors, state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
-            file_to_device(model->v_kfactors, state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
-        }
+        file_to_device(model->m_scales,   state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        file_to_device(model->v_scales,   state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        // All quantized modes load k-factors.
+        file_to_device(model->m_kfactors, state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        file_to_device(model->v_kfactors, state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
     }
     if(model->use_master_weights) {
         assert(model->master_weights != nullptr);
@@ -2895,6 +2896,16 @@ int main(int argc, char *argv[]) {
         else {
             fprintf(stderr, "Unknown --optim_quant '%s'. Expected fp32|fp8|int8|int4.\n", optim_quant_name);
             exit(EXIT_FAILURE);
+        }
+        // The optimizer kernels launch one block per group with blockDim.x = group_size.
+        // The parallel reduction inside requires group_size to be a power of two.
+        // CUDA also caps blockDim.x at 1024, and < 32 wastes a full warp.
+        if (oq > 0) {
+            bool is_pow2 = (optim_group_size > 0) && ((optim_group_size & (optim_group_size - 1)) == 0);
+            if (!is_pow2 || optim_group_size < 4 || optim_group_size > 1024) {
+                fprintf(stderr, "--optim_group_size must be a power of 2 in [4, 1024] (got %d)\n", optim_group_size);
+                exit(EXIT_FAILURE);
+            }
         }
         if (oq == 3 && optim_group_size % 2 != 0) {
             fprintf(stderr, "--optim_group_size must be even for int4 (got %d)\n", optim_group_size);
