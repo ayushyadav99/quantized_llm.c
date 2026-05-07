@@ -396,8 +396,14 @@ __global__ void adamw_kernel3_int8(
         float sc_v = v_scales[group_idx],   k_v = v_kfactors[group_idx];
         if (sc_m > 0.0f)
             m = coat_unexpand((float)((int8_t)m_q8[param_idx]) * sc_m, k_m);
-        if (sc_v > 0.0f)
-            v = coat_unexpand((float)((int8_t)v_q8[param_idx]) * sc_v, k_v);
+        if (sc_v > 0.0f) {
+            int8_t qv = (int8_t)v_q8[param_idx];
+            // When R_actual > R_int8 (=127), COAT clips k to 1 (no expansion) and
+            // small v values round to 0 in INT8 — same explosion risk as plain absmax.
+            // Floor at half a quant step in expanded space before unexpanding.
+            float expanded_v = (qv != 0) ? (float)qv * sc_v : sc_v * 0.5f;
+            v = coat_unexpand(expanded_v, k_v);
+        }
     }
 
     // 2. AdamW math in FP32 (identical to FP32 and COAT FP8 kernels).
@@ -567,8 +573,11 @@ __global__ void adamw_kernel3_int4(
         int    nibble_shift = (local_idx & 1) ? 4 : 0;
         if (sc_m > 0.0f)
             m = coat_unexpand((float)optim_decode_int4((m_int4[byte_idx] >> nibble_shift) & 0x0Fu) * sc_m, k_m);
-        if (sc_v > 0.0f)
-            v = coat_unexpand((float)optim_decode_int4((v_int4[byte_idx] >> nibble_shift) & 0x0Fu) * sc_v, k_v);
+        if (sc_v > 0.0f) {
+            int qv = optim_decode_int4((v_int4[byte_idx] >> nibble_shift) & 0x0Fu);
+            float expanded_v = (qv != 0) ? (float)qv * sc_v : sc_v * 0.5f;
+            v = coat_unexpand(expanded_v, k_v);
+        }
     }
 
     // 2. AdamW math in FP32.
