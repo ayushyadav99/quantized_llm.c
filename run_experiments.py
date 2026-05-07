@@ -9,6 +9,8 @@ import sys
 import csv
 import math
 import re
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -289,25 +291,25 @@ def extract_label(cmd):
 
 
 def find_log_dir(cmd):
-    """Return the log directory from the -o flag, or None."""
+    """Return (log_dir, is_temp, final_cmd).
+    If -o is present, use it as-is (is_temp=False).
+    Otherwise create a temp dir and append -o <tmpdir> to cmd (is_temp=True).
+    """
     m = re.search(r'-o\s+(\S+)', cmd)
-    return Path(m.group(1)) if m else None
+    if m:
+        return Path(m.group(1)), False, cmd
+    tmp = Path(tempfile.mkdtemp(prefix="exp_logs_"))
+    return tmp, True, cmd + f" -o {tmp}"
 
 
 def auto_save_path(experiments):
-    """
-    Pick a save location automatically:
-    - If all experiments share a common parent directory, save there.
-    - Otherwise save in the current working directory.
-    Returns a full Path with timestamp filename.
-    """
+    """Save SVG in the common parent of non-temp log dirs, else current dir."""
     fname = f"comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.svg"
-    log_dirs = [e["log_dir"] for e in experiments if e["log_dir"] is not None]
-    if not log_dirs:
-        return Path(fname)
-    parents = [d.resolve().parent for d in log_dirs]
-    if len(set(str(p) for p in parents)) == 1:
-        return parents[0] / fname
+    persistent_dirs = [e["log_dir"] for e in experiments if not e["is_temp"]]
+    if persistent_dirs:
+        parents = [d.resolve().parent for d in persistent_dirs]
+        if len(set(str(p) for p in parents)) == 1:
+            return parents[0] / fname
     return Path(fname)
 
 
@@ -334,34 +336,36 @@ def main():
                 sys.exit(0)
             break
 
-        log_dir = find_log_dir(cmd)
-        if log_dir is None:
-            print("  ⚠  No -o flag detected. Please add -o <log_dir> to your command.")
-            run_num -= 1
-            continue
-
+        log_dir, is_temp, run_cmd = find_log_dir(cmd)
         csv_path = log_dir / "train_losses.csv"
 
-        print(f"\n  Running: {cmd}\n" + "-" * 56)
+        print(f"\n  Running: {run_cmd}\n" + "-" * 56)
         try:
-            result = subprocess.run(cmd, shell=True)
+            result = subprocess.run(run_cmd, shell=True)
         except KeyboardInterrupt:
             print("\n  Interrupted.")
+            if is_temp:
+                shutil.rmtree(log_dir, ignore_errors=True)
             run_num -= 1
             continue
 
         if result.returncode != 0:
             print(f"  ⚠  Command exited with code {result.returncode}. Skipping this run.")
+            if is_temp:
+                shutil.rmtree(log_dir, ignore_errors=True)
             run_num -= 1
             continue
 
         if not csv_path.exists():
             print(f"  ⚠  Expected CSV not found at {csv_path}. Skipping.")
+            if is_temp:
+                shutil.rmtree(log_dir, ignore_errors=True)
             run_num -= 1
             continue
 
         label = extract_label(cmd)
-        experiments.append({"cmd": cmd, "label": label, "csv": csv_path, "log_dir": log_dir})
+        experiments.append({"cmd": cmd, "label": label, "csv": csv_path,
+                             "log_dir": log_dir, "is_temp": is_temp})
         print(f"\n  Done. Label: '{label}'")
 
         print(f"\n[Experiment {run_num}] Add another? (Enter to continue, 'done' to finish):")
@@ -404,6 +408,11 @@ def main():
     write_comparison_svg(output, series, smooth_window=SMOOTH_WINDOW, loss_label=loss_label)
     print(f"\n  Plot saved to: {output.resolve()}")
     print("  Open the SVG in a browser — hover over markers to see exact values.\n")
+
+    # Clean up temp log dirs
+    for e in experiments:
+        if e["is_temp"]:
+            shutil.rmtree(e["log_dir"], ignore_errors=True)
 
 
 if __name__ == "__main__":
