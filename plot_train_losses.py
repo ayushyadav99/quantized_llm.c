@@ -13,6 +13,7 @@ def parse_args():
     parser.add_argument("--smooth", type=int, default=1, help="Moving-average window for an extra smoothed curve.")
     parser.add_argument("--all-logs", action="store_true", help="When loss_dump is a directory, plot all train_losses*.csv files in it.")
     parser.add_argument("--title", default="Training loss", help="Plot title.")
+    parser.add_argument("--labels", nargs="+", help="Custom legend labels, one per input file.")
     return parser.parse_args()
 
 
@@ -263,9 +264,11 @@ def main():
         output = loss_dumps[0].with_name("loss_plot.svg")
 
     series = []
-    for loss_dump in loss_dumps:
+    for idx, loss_dump in enumerate(loss_dumps):
+        label = (args.labels[idx] if args.labels and idx < len(args.labels)
+                 else label_from_path(loss_dump))
         steps, losses = read_losses(loss_dump)
-        series.append({"label": label_from_path(loss_dump), "steps": steps, "losses": losses})
+        series.append({"label": label, "steps": steps, "losses": losses})
 
     smooth_window = max(1, args.smooth)
     if len(series) == 1:
