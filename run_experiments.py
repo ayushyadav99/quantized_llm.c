@@ -240,61 +240,56 @@ def main():
     print("=" * 56)
     print("  Experiment Runner")
     print("=" * 56)
-    print("Enter training commands one at a time.")
-    print("Type 'done' when finished.\n")
+    print("Paste all experiment commands (one per line).")
+    print("Leave a blank line when done.\n")
 
-    experiments = []
-    exp_num = 0
-
+    # ── Collect all commands upfront (paste-friendly) ────────────────────────
+    commands = []
     while True:
-        exp_num += 1
-        cmd = ask(f"[Experiment {exp_num}] Command (or 'done'):\n  > ")
-
-        if cmd.lower() in ("done", "no", "n", "quit", "exit", ""):
-            if not experiments:
-                print("No experiments run. Exiting.")
-                sys.exit(0)
+        cmd = ask(f"  [{len(commands)+1}] > ")
+        if not cmd:
+            if not commands:
+                print("  Enter at least one command.")
+                continue
             break
+        commands.append(cmd)
 
+    print(f"\n  {len(commands)} experiment(s) queued. Starting runs...\n")
+
+    # ── Run all ──────────────────────────────────────────────────────────────
+    experiments = []
+    for exp_num, cmd in enumerate(commands, 1):
         log_dir, is_temp, run_cmd = make_run_cmd(cmd, exp_num)
         csv_path = log_dir / "train_losses.csv"
 
-        print(f"\n  Running: {run_cmd}\n" + "-" * 56)
+        print("\n" + "=" * 56)
+        print(f"  [{exp_num}/{len(commands)}] {extract_label(cmd)}")
+        print("=" * 56)
+        print(f"  {run_cmd}\n")
+
         try:
-            # stdin=None inherits terminal so training output is live;
-            # the training binary does not read stdin so this is safe.
             result = subprocess.run(run_cmd, shell=True, stdin=open(os.devnull))
         except KeyboardInterrupt:
             print("\n  Interrupted — skipping.")
             if is_temp: shutil.rmtree(log_dir, ignore_errors=True)
-            exp_num -= 1
             continue
 
-        print("\n" + "=" * 56)
-        print("  TRAINING COMPLETE")
-        print("=" * 56)
+        print("\n" + "─" * 56)
 
         if result.returncode != 0:
-            print(f"  Command exited with code {result.returncode} — skipping.")
+            print(f"  Exited with code {result.returncode} — skipping.")
             if is_temp: shutil.rmtree(log_dir, ignore_errors=True)
-            exp_num -= 1
             continue
 
         if not csv_path.exists():
             print(f"  CSV not found at {csv_path} — skipping.")
             if is_temp: shutil.rmtree(log_dir, ignore_errors=True)
-            exp_num -= 1
             continue
 
         label = extract_label(cmd)
         experiments.append({"cmd": cmd, "label": label,
                              "csv": csv_path, "log_dir": log_dir, "is_temp": is_temp})
-        print(f"  Label: '{label}'")
-
-        ans = ask("\n  Add another experiment? [y/n, default: n]: ")
-        if not ans.lower().startswith("y"):
-            break
-        print()
+        print(f"  Done. Label: '{label}'")
 
     # Ask train or val
     print("\n" + "=" * 56)
