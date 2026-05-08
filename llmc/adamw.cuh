@@ -133,14 +133,14 @@ __global__ void adamw_kernel3_coat(
     ptrdiff_t s_stride, ptrdiff_t meta_stride,
     float learning_rate, float beta1, float beta2,
     float beta1_correction, float beta2_correction,
-    float eps, float weight_decay, float grad_scale, unsigned int seed
+    float eps, float weight_decay, float grad_scale, unsigned int seed, bool coat_expansion
 ) {
     // blockIdx.x = group index within this slice
     // blockIdx.y = slice index (layer in multi-layer tensors)
     // threadIdx.x = parameter index within the group  [0, COAT_GROUP_SIZE)
     size_t group_idx = blockIdx.x;
     int    local_idx = threadIdx.x;
-    size_t param_idx = group_idx * (size_t)COAT_GROUP_SIZE + local_idx;
+    size_t param_idx = group_idx * (size_t)blockDim.x + local_idx;
     bool in_bounds   = (param_idx < num_parameters);
 
     // Apply per-slice pointer offsets (same role as blockIdx.y * stride in adamw_kernel3).
@@ -211,6 +211,7 @@ __global__ void adamw_kernel3_coat(
 
         float new_k_m, new_scale_m;
         coat_group_meta(max_m, min_m, &new_k_m, &new_scale_m);
+        if (!coat_expansion) { new_k_m = 1.0f; new_scale_m = max_m > 0.0f ? COAT_FP8_MAX / max_m : 1.0f; }
 
         if (in_bounds) {
             float expanded = coat_expand(m, new_k_m) * new_scale_m;
@@ -248,6 +249,7 @@ __global__ void adamw_kernel3_coat(
 
         float new_k_v, new_scale_v;
         coat_group_meta(max_v, min_v, &new_k_v, &new_scale_v);
+        if (!coat_expansion) { new_k_v = 1.0f; new_scale_v = max_v > 0.0f ? COAT_FP8_MAX / max_v : 1.0f; }
 
         if (in_bounds) {
             float expanded = coat_expand(v, new_k_v) * new_scale_v;
@@ -273,7 +275,7 @@ void adamw_update_coat(
     int group_size,
     float learning_rate, float beta1, float beta2, int t,
     float eps, float weight_decay, float grad_scale, unsigned int seed,
-    cudaStream_t stream
+    bool coat_expansion, cudaStream_t stream
 ) {
     size_t    num_groups  = CEIL_DIV(num_parameters, (size_t)group_size);
     ptrdiff_t meta_stride = (ptrdiff_t)CEIL_DIV(s_stride, group_size);
@@ -285,7 +287,7 @@ void adamw_update_coat(
         m_fp8, v_fp8, m_scales, v_scales, m_kfactors, v_kfactors,
         num_parameters, w_stride, g_stride, s_stride, meta_stride,
         learning_rate, beta1, beta2, beta1_corr, beta2_corr,
-        eps, weight_decay, grad_scale, seed
+        eps, weight_decay, grad_scale, seed, coat_expansion
     );
     cudaCheck(cudaGetLastError());
 }
@@ -371,7 +373,7 @@ __global__ void adamw_kernel3_int8(
     ptrdiff_t w_stride, ptrdiff_t g_stride, ptrdiff_t s_stride, ptrdiff_t meta_stride,
     float learning_rate, float beta1, float beta2,
     float beta1_correction, float beta2_correction,
-    float eps, float weight_decay, float grad_scale, unsigned int seed
+    float eps, float weight_decay, float grad_scale, unsigned int seed, bool coat_expansion
 ) {
     size_t group_idx = blockIdx.x;
     int    local_idx = threadIdx.x;
@@ -448,6 +450,7 @@ __global__ void adamw_kernel3_int8(
 
         float new_k_m, new_scale_m;
         coat_group_meta_int8(max_m, min_m, &new_k_m, &new_scale_m);
+        if (!coat_expansion) { new_k_m = 1.0f; new_scale_m = max_m > 0.0f ? max_m / 127.0f : 0.0f; }
 
         if (in_bounds) {
             float q_float = (new_scale_m > 0.0f)
@@ -484,6 +487,7 @@ __global__ void adamw_kernel3_int8(
 
         float new_k_v, new_scale_v;
         coat_group_meta_int8(max_v, min_v, &new_k_v, &new_scale_v);
+        if (!coat_expansion) { new_k_v = 1.0f; new_scale_v = max_v > 0.0f ? max_v / 127.0f : 0.0f; }
 
         if (in_bounds) {
             float q_float = (new_scale_v > 0.0f)
@@ -509,7 +513,7 @@ void adamw_update_int8(
     int group_size,
     float learning_rate, float beta1, float beta2, int t,
     float eps, float weight_decay, float grad_scale, unsigned int seed,
-    cudaStream_t stream
+    bool coat_expansion, cudaStream_t stream
 ) {
     size_t    num_groups  = CEIL_DIV(num_parameters, (size_t)group_size);
     ptrdiff_t meta_stride = (ptrdiff_t)CEIL_DIV(s_stride, group_size);
@@ -521,7 +525,7 @@ void adamw_update_int8(
         m_q8, v_q8, m_scales, v_scales, m_kfactors, v_kfactors,
         num_parameters, w_stride, g_stride, s_stride, meta_stride,
         learning_rate, beta1, beta2, beta1_corr, beta2_corr,
-        eps, weight_decay, grad_scale, seed
+        eps, weight_decay, grad_scale, seed, coat_expansion
     );
     cudaCheck(cudaGetLastError());
 }
@@ -545,7 +549,7 @@ __global__ void adamw_kernel3_int4(
     ptrdiff_t s_stride, ptrdiff_t meta_stride,
     float learning_rate, float beta1, float beta2,
     float beta1_correction, float beta2_correction,
-    float eps, float weight_decay, float grad_scale, unsigned int seed
+    float eps, float weight_decay, float grad_scale, unsigned int seed, bool coat_expansion
 ) {
     size_t group_idx = blockIdx.x;
     int    local_idx = threadIdx.x;
@@ -623,6 +627,7 @@ __global__ void adamw_kernel3_int4(
 
         float new_k_m, new_scale_m;
         coat_group_meta_int4(max_m, min_m, &new_k_m, &new_scale_m);
+        if (!coat_expansion) { new_k_m = 1.0f; new_scale_m = max_m > 0.0f ? max_m / 7.0f : 0.0f; }
 
         float q_float = (in_bounds && new_scale_m > 0.0f)
                         ? coat_expand(m, new_k_m) / new_scale_m : 0.0f;
@@ -663,6 +668,7 @@ __global__ void adamw_kernel3_int4(
 
         float new_k_v, new_scale_v;
         coat_group_meta_int4(max_v, min_v, &new_k_v, &new_scale_v);
+        if (!coat_expansion) { new_k_v = 1.0f; new_scale_v = max_v > 0.0f ? max_v / 7.0f : 0.0f; }
 
         float q_float = (in_bounds && new_scale_v > 0.0f)
                         ? coat_expand(v, new_k_v) / new_scale_v : 0.0f;
@@ -692,7 +698,7 @@ void adamw_update_int4(
     int group_size,
     float learning_rate, float beta1, float beta2, int t,
     float eps, float weight_decay, float grad_scale, unsigned int seed,
-    cudaStream_t stream
+    bool coat_expansion, cudaStream_t stream
 ) {
     size_t    num_groups  = CEIL_DIV(num_parameters, (size_t)group_size);
     ptrdiff_t meta_stride = (ptrdiff_t)CEIL_DIV(s_stride, group_size);
@@ -705,7 +711,7 @@ void adamw_update_int4(
         m_int4, v_int4, m_scales, v_scales, m_kfactors, v_kfactors,
         num_parameters, w_stride, g_stride, s_stride, meta_stride,
         learning_rate, beta1, beta2, beta1_corr, beta2_corr,
-        eps, weight_decay, grad_scale, seed
+        eps, weight_decay, grad_scale, seed, coat_expansion
     );
     cudaCheck(cudaGetLastError());
 }
