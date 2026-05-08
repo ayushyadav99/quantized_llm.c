@@ -140,7 +140,7 @@ __global__ void adamw_kernel3_coat(
     // threadIdx.x = parameter index within the group  [0, COAT_GROUP_SIZE)
     size_t group_idx = blockIdx.x;
     int    local_idx = threadIdx.x;
-    size_t param_idx = group_idx * (size_t)COAT_GROUP_SIZE + local_idx;
+    size_t param_idx = group_idx * (size_t)blockDim.x + local_idx;
     bool in_bounds   = (param_idx < num_parameters);
 
     // Apply per-slice pointer offsets (same role as blockIdx.y * stride in adamw_kernel3).
