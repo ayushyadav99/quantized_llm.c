@@ -3073,6 +3073,9 @@ void error_usage() {
     fprintf(stderr, "  --ptq_precision <str> PTQ precision for quantized weights: int8|fp8|int4 (default = int8)\n");
     fprintf(stderr, "  --ptq_group_size <int> group size along cols for group-wise int4 quantization\n");
     fprintf(stderr, "                         (default = 128 when precision=int4, 0 = per-row otherwise)\n");
+    fprintf(stderr, "  --aq <0|1>            enable activation quantization (default = 0)\n");
+    fprintf(stderr, "  --aq_type <str>       activation quantization type: fp8 (default = fp8)\n");
+    fprintf(stderr, "  --aq_group_size <int> group size for activation quantization (default = 32)\n");
     fprintf(stderr, "  --optim_quant <str>   optimizer state format: fp32|fp8|int8|int4 (default = fp32)\n");
     fprintf(stderr, "  --optim_group_size <int> group size for quantized moments (default = %d)\n", COAT_GROUP_SIZE);
     // multi-node settings
@@ -3125,6 +3128,9 @@ int main(int argc, char *argv[]) {
     int ptq_group_size = -1; // -1 = unset; resolved after we know the precision
     const char* optim_quant_name = "fp32";
     int optim_group_size = COAT_GROUP_SIZE;
+    int aq_enabled = 0;
+    const char* aq_type_name = "fp8";
+    int aq_group_size = 32;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -3137,6 +3143,9 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--ptq") == 0) { ptq_enabled = atoi(argv[i+1]); continue; }
         if (strcmp(argv[i], "--ptq_precision") == 0) { ptq_precision_name = argv[i+1]; continue; }
         if (strcmp(argv[i], "--ptq_group_size") == 0) { ptq_group_size = atoi(argv[i+1]); continue; }
+        if (strcmp(argv[i], "--aq") == 0) { aq_enabled = atoi(argv[i+1]); continue; }
+        if (strcmp(argv[i], "--aq_type") == 0) { aq_type_name = argv[i+1]; continue; }
+        if (strcmp(argv[i], "--aq_group_size") == 0) { aq_group_size = atoi(argv[i+1]); continue; }
         if (strcmp(argv[i], "--optim_quant") == 0) { optim_quant_name = argv[i+1]; continue; }
         if (strcmp(argv[i], "--optim_group_size") == 0) { optim_group_size = atoi(argv[i+1]); continue; }
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -3238,6 +3247,9 @@ int main(int argc, char *argv[]) {
     printf0("| ptq enabled           | %-50s |\n", ptq_enabled ? "yes" : "no");
     printf0("| ptq precision         | %-50s |\n", ptq_enabled ? ptq_precision_name : "n/a");
     printf0("| ptq group_size (req)  | %-50d |\n", ptq_enabled ? ptq_group_size : 0);
+    printf0("| aq enabled            | %-50s |\n", aq_enabled ? "yes" : "no");
+    printf0("| aq type               | %-50s |\n", aq_enabled ? aq_type_name : "n/a");
+    printf0("| aq group_size         | %-50d |\n", aq_enabled ? aq_group_size : 0);
     printf0("| optim_quant           | %-50s |\n", optim_quant_name);
     printf0("| optim_group_size      | %-50d |\n", optim_group_size);
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -3306,6 +3318,24 @@ int main(int argc, char *argv[]) {
         }
         model.optim_quant      = oq;
         model.optim_group_size = optim_group_size;
+    }
+    // Parse aq_type name → AQType
+    {
+        AQType at = AQ_TYPE_NONE;
+        if (aq_enabled) {
+            if (strcmp(aq_type_name, "fp8") == 0) at = AQ_TYPE_FP8;
+            else {
+                fprintf(stderr, "Unknown --aq_type '%s'. Expected fp8.\n", aq_type_name);
+                exit(EXIT_FAILURE);
+            }
+            if (aq_group_size <= 0) {
+                fprintf(stderr, "--aq_group_size must be positive (got %d)\n", aq_group_size);
+                exit(EXIT_FAILURE);
+            }
+        }
+        model.aq_enabled   = aq_enabled;
+        model.aq_type      = at;
+        model.aq_group_size = aq_group_size;
     }
     model.ptq_precision = ptq_enabled ? ptq_precision_from_string(ptq_precision_name) : PTQ_PRECISION_NONE;
     // ptq_group_size has already been resolved above (default 128 for int4, 0 per-row otherwise).
