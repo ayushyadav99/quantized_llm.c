@@ -1191,11 +1191,12 @@ size_t aq_estimate_activation_bytes(const GPT2* model) {
     size_t max_groups = 0;
     for (int i = 0; i < NUM_AQ_TENSORS; ++i) {
         AQTensorLayout lo = aq_tensor_layout_for_id(model, i);
-        if (lo.rows % model->aq_group_size != 0 || lo.cols % model->aq_group_size != 0) {
+        if (lo.cols % model->aq_group_size != 0) {
             return 0;
         }
         const size_t elems = (size_t)lo.rows * lo.cols;
-        const size_t groups = (size_t)(lo.rows / model->aq_group_size) * (size_t)(lo.cols / model->aq_group_size);
+        // COAT-style 1×group_n row quantization: one group per row-slice of group_n cols
+        const size_t groups = (size_t)lo.rows * (size_t)(lo.cols / model->aq_group_size);
         qvalue_bytes += elems * sizeof(uint8_t);
         scale_bytes += groups * sizeof(float);
         if (elems > max_elems) max_elems = elems;
@@ -1260,9 +1261,9 @@ void gpt2_prepare_aq(GPT2* model) {
     size_t max_groups = 0;
     for (int i = 0; i < NUM_AQ_TENSORS; ++i) {
         AQTensorLayout lo = aq_tensor_layout_for_id(model, i);
-        if (lo.rows % model->aq_group_size != 0 || lo.cols % model->aq_group_size != 0) {
-            fprintf(stderr, "AQ square group size %d must divide tensor %d shape (%d,%d)\n",
-                    model->aq_group_size, i, lo.rows, lo.cols);
+        if (lo.cols % model->aq_group_size != 0) {
+            fprintf(stderr, "AQ group_n %d must divide tensor %d cols (%d)\n",
+                    model->aq_group_size, i, lo.cols);
             exit(EXIT_FAILURE);
         }
         size_t elems = (size_t)lo.rows * lo.cols;
@@ -1270,7 +1271,8 @@ void gpt2_prepare_aq(GPT2* model) {
             fprintf(stderr, "AQ INT4: tensor %d has odd element count (%zu) — cannot nibble-pack\n", i, elems);
             exit(EXIT_FAILURE);
         }
-        int ngr = lo.rows / model->aq_group_size;
+        // COAT-style 1×group_n: one group per row-slice of group_n cols
+        int ngr = lo.rows;
         int ngc = lo.cols / model->aq_group_size;
         size_t groups = (size_t)ngr * ngc;
         if (elems > max_elems) max_elems = elems;
@@ -1289,7 +1291,7 @@ void gpt2_prepare_aq(GPT2* model) {
             cudaCheck(cudaMalloc((void**)&qt->scales, groups * sizeof(float)));
             qt->rows = lo.rows;
             qt->cols = lo.cols;
-            qt->group_m = model->aq_group_size;
+            qt->group_m = 1;                    // COAT-style: one row per group
             qt->group_n = model->aq_group_size;
             qt->num_group_rows = ngr;
             qt->num_group_cols = ngc;
@@ -3257,7 +3259,7 @@ void error_usage() {
     fprintf(stderr, "                         (default = 128 when precision=int4, 0 = per-row otherwise)\n");
     fprintf(stderr, "  --aq <0|1>            enable activation quantization (default = 0)\n");
     fprintf(stderr, "  --aq_type <str>       activation quantization type: fp8|int8|int4 (default = fp8)\n");
-    fprintf(stderr, "  --aq_group_size <int> group size for activation quantization (default = 32)\n");
+    fprintf(stderr, "  --aq_group_size <int> cols per group for activation quantization — COAT-style 1xN row groups (default = 32)\n");
     fprintf(stderr, "  --optim_quant <str>   optimizer state format: fp32|fp8|int8|int4 (default = fp32)\n");
     fprintf(stderr, "  --optim_group_size <int> group size for quantized moments (default = %d)\n", COAT_GROUP_SIZE);
     fprintf(stderr, "  --coat_expansion <0|1> COAT dynamic range expansion: 1=on (default), 0=plain absmax\n");
