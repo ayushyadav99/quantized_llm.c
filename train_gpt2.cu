@@ -321,6 +321,87 @@ void aq_dequantize_int8_rows_gpu(floatX* dst, const uint8_t* src, const float* s
         dst, src, scales, rows, cols, group_m, group_n, ngc);
 }
 
+constexpr float INT4_QUANT_MAX = 7.0f;
+
+__host__ __device__ inline int ptq_decode_int4_nibble(uint8_t nibble);
+__host__ __device__ inline uint8_t ptq_encode_int4_nibble(int value);
+__host__ __device__ inline uint8_t ptq_pack_int4_pair(int low, int high);
+
+// Each thread handles one packed byte (two logical INT4 elements).
+// Pairs are taken in flat row-major order; each element independently looks up its 2D group scale.
+__global__ void aq_quantize_int4_apply_kernel(uint8_t* __restrict__ dst,
+                                              const floatX* __restrict__ src,
+                                              const float* __restrict__ scales,
+                                              int rows, int cols,
+                                              int group_m, int group_n, int num_group_cols) {
+    const int byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int count = rows * cols;
+    const int idx0 = byte_idx * 2;
+    if (idx0 >= count) return;
+
+    const int row0 = idx0 / cols, col0 = idx0 - row0 * cols;
+    const float val0 = (float)src[idx0] / scales[aq_scale_idx_2d(row0, col0, num_group_cols, group_m, group_n)];
+    const int q0 = (int)lrintf(fmaxf(-INT4_QUANT_MAX, fminf(INT4_QUANT_MAX, val0)));
+
+    int q1 = 0;
+    const int idx1 = idx0 + 1;
+    if (idx1 < count) {
+        const int row1 = idx1 / cols, col1 = idx1 - row1 * cols;
+        const float val1 = (float)src[idx1] / scales[aq_scale_idx_2d(row1, col1, num_group_cols, group_m, group_n)];
+        q1 = (int)lrintf(fmaxf(-INT4_QUANT_MAX, fminf(INT4_QUANT_MAX, val1)));
+    }
+    dst[byte_idx] = ptq_pack_int4_pair(q0, q1);
+}
+
+__global__ void aq_dequantize_int4_kernel(floatX* __restrict__ dst,
+                                          const uint8_t* __restrict__ src,
+                                          const float* __restrict__ scales,
+                                          int rows, int cols,
+                                          int group_m, int group_n, int num_group_cols) {
+    const int byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int count = rows * cols;
+    const int idx0 = byte_idx * 2;
+    if (idx0 >= count) return;
+
+    const uint8_t packed = src[byte_idx];
+
+    const int row0 = idx0 / cols, col0 = idx0 - row0 * cols;
+    const float scale0 = scales[aq_scale_idx_2d(row0, col0, num_group_cols, group_m, group_n)];
+    dst[idx0] = (floatX)(ptq_decode_int4_nibble(packed & 0x0F) * scale0);
+
+    const int idx1 = idx0 + 1;
+    if (idx1 < count) {
+        const int row1 = idx1 / cols, col1 = idx1 - row1 * cols;
+        const float scale1 = scales[aq_scale_idx_2d(row1, col1, num_group_cols, group_m, group_n)];
+        dst[idx1] = (floatX)(ptq_decode_int4_nibble(packed >> 4) * scale1);
+    }
+}
+
+void aq_quantize_int4_rows_gpu(uint8_t* qdst, float* scales, float* group_maxes_scratch,
+                               const floatX* src, int rows, int cols, int group_m, int group_n,
+                               cudaStream_t stream) {
+    const int ngr = CEIL_DIV(rows, group_m);
+    const int ngc = CEIL_DIV(cols, group_n);
+    const size_t total_groups = (size_t)ngr * ngc;
+    dim3 grid(ngc, ngr);
+    aq_find_group_max_kernel<<<grid, 256, 0, stream>>>(group_maxes_scratch, src, rows, cols,
+                                                       group_m, group_n, ngc);
+    ptq_write_scales_kernel<<<CEIL_DIV(total_groups, (size_t)256), 256, 0, stream>>>(
+        scales, group_maxes_scratch, total_groups, INT4_QUANT_MAX);
+    const int qbytes = ((size_t)rows * cols + 1) / 2;
+    aq_quantize_int4_apply_kernel<<<CEIL_DIV(qbytes, 256), 256, 0, stream>>>(
+        qdst, src, scales, rows, cols, group_m, group_n, ngc);
+}
+
+void aq_dequantize_int4_rows_gpu(floatX* dst, const uint8_t* src, const float* scales,
+                                 int rows, int cols, int group_m, int group_n,
+                                 cudaStream_t stream) {
+    const int ngc = CEIL_DIV(cols, group_n);
+    const int qbytes = ((size_t)rows * cols + 1) / 2;
+    aq_dequantize_int4_kernel<<<CEIL_DIV(qbytes, 256), 256, 0, stream>>>(
+        dst, src, scales, rows, cols, group_m, group_n, ngc);
+}
+
 __host__ __device__ inline int ptq_decode_int4_nibble(uint8_t nibble) {
     constexpr int INT4_BITS = 4;
     constexpr uint8_t INT4_MASK = (1u << INT4_BITS) - 1u;
@@ -717,6 +798,7 @@ enum AQType {
     AQ_TYPE_NONE = 0,
     AQ_TYPE_FP8  = 1,
     AQ_TYPE_INT8 = 2,
+    AQ_TYPE_INT4 = 3,
 };
 
 typedef struct {
@@ -1165,8 +1247,8 @@ void gpt2_prepare_aq(GPT2* model) {
         model->aq.initialized = false;
         return;
     }
-    if (model->aq_type != AQ_TYPE_FP8 && model->aq_type != AQ_TYPE_INT8) {
-        fprintf(stderr, "AQ type not supported. Expected fp8 or int8.\n");
+    if (model->aq_type != AQ_TYPE_FP8 && model->aq_type != AQ_TYPE_INT8 && model->aq_type != AQ_TYPE_INT4) {
+        fprintf(stderr, "AQ type not supported. Expected fp8, int8, or int4.\n");
         exit(EXIT_FAILURE);
     }
     if (model->aq_group_size <= 0) {
@@ -1183,6 +1265,10 @@ void gpt2_prepare_aq(GPT2* model) {
             exit(EXIT_FAILURE);
         }
         size_t elems = (size_t)lo.rows * lo.cols;
+        if (model->aq_type == AQ_TYPE_INT4 && elems % 2 != 0) {
+            fprintf(stderr, "AQ INT4: tensor %d has odd element count (%zu) — cannot nibble-pack\n", i, elems);
+            exit(EXIT_FAILURE);
+        }
         int ngr = lo.rows / model->aq_group_size;
         int ngc = lo.cols / model->aq_group_size;
         size_t groups = (size_t)ngr * ngc;
@@ -1196,7 +1282,9 @@ void gpt2_prepare_aq(GPT2* model) {
             *qt = {};
         }
         if (!qt->initialized) {
-            cudaCheck(cudaMalloc((void**)&qt->qvalues, elems * sizeof(uint8_t)));
+            // INT4 packs two logical values per byte
+            size_t qbytes = (model->aq_type == AQ_TYPE_INT4) ? (elems + 1) / 2 : elems;
+            cudaCheck(cudaMalloc((void**)&qt->qvalues, qbytes * sizeof(uint8_t)));
             cudaCheck(cudaMalloc((void**)&qt->scales, groups * sizeof(float)));
             qt->rows = lo.rows;
             qt->cols = lo.cols;
@@ -1225,7 +1313,8 @@ void gpt2_prepare_aq(GPT2* model) {
     size_t aq_scale_bytes = 0;
     for (int i = 0; i < NUM_AQ_TENSORS; ++i) {
         const QuantizedActivationTensor* qt = &model->aq.tensors[i];
-        aq_qvalue_bytes += qt->qvalue_count * sizeof(uint8_t);
+        size_t qbytes = (model->aq_type == AQ_TYPE_INT4) ? (qt->qvalue_count + 1) / 2 : qt->qvalue_count;
+        aq_qvalue_bytes += qbytes * sizeof(uint8_t);
         aq_scale_bytes += qt->scale_count * sizeof(float);
     }
     const size_t aq_scratch_bytes = model->aq_scratch_elems * sizeof(floatX);
@@ -1247,12 +1336,18 @@ void aq_quantize_tensor_slice(GPT2* model, int aq_id, int layer_or_zero, const f
     }
     size_t elem_offset = (size_t)layer_or_zero * layer_rows * qt->cols;
     size_t scale_offset = (size_t)layer_or_zero * (layer_rows / qt->group_m) * qt->num_group_cols;
-    if (model->aq_type == AQ_TYPE_INT8) {
-        aq_quantize_int8_rows_gpu(qt->qvalues + elem_offset, qt->scales + scale_offset,
+    // INT4 packs two logical elements per byte, so the byte offset is half the element offset
+    size_t byte_offset = (model->aq_type == AQ_TYPE_INT4) ? elem_offset / 2 : elem_offset;
+    if (model->aq_type == AQ_TYPE_INT4) {
+        aq_quantize_int4_rows_gpu(qt->qvalues + byte_offset, qt->scales + scale_offset,
+                                  model->aq_group_maxes_scratch, src, layer_rows, qt->cols,
+                                  qt->group_m, qt->group_n, stream);
+    } else if (model->aq_type == AQ_TYPE_INT8) {
+        aq_quantize_int8_rows_gpu(qt->qvalues + byte_offset, qt->scales + scale_offset,
                                   model->aq_group_maxes_scratch, src, layer_rows, qt->cols,
                                   qt->group_m, qt->group_n, stream);
     } else {
-        aq_quantize_fp8_rows_gpu(qt->qvalues + elem_offset, qt->scales + scale_offset,
+        aq_quantize_fp8_rows_gpu(qt->qvalues + byte_offset, qt->scales + scale_offset,
                                  model->aq_group_maxes_scratch, src, layer_rows, qt->cols,
                                  qt->group_m, qt->group_n, stream);
     }
@@ -1264,11 +1359,15 @@ void aq_dequantize_tensor_slice(GPT2* model, int aq_id, int layer_or_zero, float
     int layer_rows = model->batch_size * model->seq_len;
     size_t elem_offset = (size_t)layer_or_zero * layer_rows * qt->cols;
     size_t scale_offset = (size_t)layer_or_zero * (layer_rows / qt->group_m) * qt->num_group_cols;
-    if (model->aq_type == AQ_TYPE_INT8) {
-        aq_dequantize_int8_rows_gpu(dst, qt->qvalues + elem_offset, qt->scales + scale_offset,
+    size_t byte_offset = (model->aq_type == AQ_TYPE_INT4) ? elem_offset / 2 : elem_offset;
+    if (model->aq_type == AQ_TYPE_INT4) {
+        aq_dequantize_int4_rows_gpu(dst, qt->qvalues + byte_offset, qt->scales + scale_offset,
+                                    layer_rows, qt->cols, qt->group_m, qt->group_n, stream);
+    } else if (model->aq_type == AQ_TYPE_INT8) {
+        aq_dequantize_int8_rows_gpu(dst, qt->qvalues + byte_offset, qt->scales + scale_offset,
                                     layer_rows, qt->cols, qt->group_m, qt->group_n, stream);
     } else {
-        aq_dequantize_fp8_rows_gpu(dst, qt->qvalues + elem_offset, qt->scales + scale_offset,
+        aq_dequantize_fp8_rows_gpu(dst, qt->qvalues + byte_offset, qt->scales + scale_offset,
                                    layer_rows, qt->cols, qt->group_m, qt->group_n, stream);
     }
 }
@@ -3141,7 +3240,7 @@ void error_usage() {
     fprintf(stderr, "  --ptq_group_size <int> group size along cols for group-wise int4 quantization\n");
     fprintf(stderr, "                         (default = 128 when precision=int4, 0 = per-row otherwise)\n");
     fprintf(stderr, "  --aq <0|1>            enable activation quantization (default = 0)\n");
-    fprintf(stderr, "  --aq_type <str>       activation quantization type: fp8|int8 (default = fp8)\n");
+    fprintf(stderr, "  --aq_type <str>       activation quantization type: fp8|int8|int4 (default = fp8)\n");
     fprintf(stderr, "  --aq_group_size <int> group size for activation quantization (default = 32)\n");
     fprintf(stderr, "  --optim_quant <str>   optimizer state format: fp32|fp8|int8|int4 (default = fp32)\n");
     fprintf(stderr, "  --optim_group_size <int> group size for quantized moments (default = %d)\n", COAT_GROUP_SIZE);
@@ -3392,8 +3491,9 @@ int main(int argc, char *argv[]) {
         if (aq_enabled) {
             if      (strcmp(aq_type_name, "fp8")  == 0) at = AQ_TYPE_FP8;
             else if (strcmp(aq_type_name, "int8") == 0) at = AQ_TYPE_INT8;
+            else if (strcmp(aq_type_name, "int4") == 0) at = AQ_TYPE_INT4;
             else {
-                fprintf(stderr, "Unknown --aq_type '%s'. Expected fp8|int8.\n", aq_type_name);
+                fprintf(stderr, "Unknown --aq_type '%s'. Expected fp8|int8|int4.\n", aq_type_name);
                 exit(EXIT_FAILURE);
             }
             if (aq_group_size <= 0) {
