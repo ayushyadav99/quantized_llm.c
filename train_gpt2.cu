@@ -266,6 +266,61 @@ void aq_dequantize_fp8_rows_gpu(floatX* dst, const uint8_t* src, const float* sc
         dst, src, scales, rows, cols, group_m, group_n, ngc);
 }
 
+constexpr float INT8_QUANT_MAX = 127.0f;
+
+__global__ void aq_quantize_int8_apply_kernel(uint8_t* __restrict__ dst,
+                                              const floatX* __restrict__ src,
+                                              const float* __restrict__ scales,
+                                              int rows, int cols,
+                                              int group_m, int group_n, int num_group_cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int row = idx / cols;
+    int col = idx - row * cols;
+    float scale = scales[aq_scale_idx_2d(row, col, num_group_cols, group_m, group_n)];
+    float v = (float)src[idx] / scale;
+    int8_t q = (int8_t)fmaxf(-INT8_QUANT_MAX, fminf(INT8_QUANT_MAX, rintf(v)));
+    dst[idx] = (uint8_t)q;
+}
+
+__global__ void aq_dequantize_int8_kernel(floatX* __restrict__ dst,
+                                          const uint8_t* __restrict__ src,
+                                          const float* __restrict__ scales,
+                                          int rows, int cols,
+                                          int group_m, int group_n, int num_group_cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int row = idx / cols;
+    int col = idx - row * cols;
+    float scale = scales[aq_scale_idx_2d(row, col, num_group_cols, group_m, group_n)];
+    dst[idx] = (floatX)((int8_t)src[idx] * scale);
+}
+
+void aq_quantize_int8_rows_gpu(uint8_t* qdst, float* scales, float* group_maxes_scratch,
+                               const floatX* src, int rows, int cols, int group_m, int group_n,
+                               cudaStream_t stream) {
+    const int ngr = CEIL_DIV(rows, group_m);
+    const int ngc = CEIL_DIV(cols, group_n);
+    const size_t total_groups = (size_t)ngr * ngc;
+    dim3 grid(ngc, ngr);
+    aq_find_group_max_kernel<<<grid, 256, 0, stream>>>(group_maxes_scratch, src, rows, cols,
+                                                       group_m, group_n, ngc);
+    ptq_write_scales_kernel<<<CEIL_DIV(total_groups, (size_t)256), 256, 0, stream>>>(
+        scales, group_maxes_scratch, total_groups, INT8_QUANT_MAX);
+    int count = rows * cols;
+    aq_quantize_int8_apply_kernel<<<CEIL_DIV(count, 256), 256, 0, stream>>>(
+        qdst, src, scales, rows, cols, group_m, group_n, ngc);
+}
+
+void aq_dequantize_int8_rows_gpu(floatX* dst, const uint8_t* src, const float* scales,
+                                 int rows, int cols, int group_m, int group_n,
+                                 cudaStream_t stream) {
+    const int ngc = CEIL_DIV(cols, group_n);
+    int count = rows * cols;
+    aq_dequantize_int8_kernel<<<CEIL_DIV(count, 256), 256, 0, stream>>>(
+        dst, src, scales, rows, cols, group_m, group_n, ngc);
+}
+
 __host__ __device__ inline int ptq_decode_int4_nibble(uint8_t nibble) {
     constexpr int INT4_BITS = 4;
     constexpr uint8_t INT4_MASK = (1u << INT4_BITS) - 1u;
@@ -660,7 +715,8 @@ typedef struct {
 
 enum AQType {
     AQ_TYPE_NONE = 0,
-    AQ_TYPE_FP8 = 1,
+    AQ_TYPE_FP8  = 1,
+    AQ_TYPE_INT8 = 2,
 };
 
 typedef struct {
@@ -1109,8 +1165,8 @@ void gpt2_prepare_aq(GPT2* model) {
         model->aq.initialized = false;
         return;
     }
-    if (model->aq_type != AQ_TYPE_FP8) {
-        fprintf(stderr, "AQ type not supported. v1 supports only fp8.\n");
+    if (model->aq_type != AQ_TYPE_FP8 && model->aq_type != AQ_TYPE_INT8) {
+        fprintf(stderr, "AQ type not supported. Expected fp8 or int8.\n");
         exit(EXIT_FAILURE);
     }
     if (model->aq_group_size <= 0) {
@@ -1191,9 +1247,15 @@ void aq_quantize_tensor_slice(GPT2* model, int aq_id, int layer_or_zero, const f
     }
     size_t elem_offset = (size_t)layer_or_zero * layer_rows * qt->cols;
     size_t scale_offset = (size_t)layer_or_zero * (layer_rows / qt->group_m) * qt->num_group_cols;
-    aq_quantize_fp8_rows_gpu(qt->qvalues + elem_offset, qt->scales + scale_offset,
-                             model->aq_group_maxes_scratch, src, layer_rows, qt->cols,
-                             qt->group_m, qt->group_n, stream);
+    if (model->aq_type == AQ_TYPE_INT8) {
+        aq_quantize_int8_rows_gpu(qt->qvalues + elem_offset, qt->scales + scale_offset,
+                                  model->aq_group_maxes_scratch, src, layer_rows, qt->cols,
+                                  qt->group_m, qt->group_n, stream);
+    } else {
+        aq_quantize_fp8_rows_gpu(qt->qvalues + elem_offset, qt->scales + scale_offset,
+                                 model->aq_group_maxes_scratch, src, layer_rows, qt->cols,
+                                 qt->group_m, qt->group_n, stream);
+    }
 }
 
 void aq_dequantize_tensor_slice(GPT2* model, int aq_id, int layer_or_zero, floatX* dst, cudaStream_t stream) {
@@ -1202,8 +1264,13 @@ void aq_dequantize_tensor_slice(GPT2* model, int aq_id, int layer_or_zero, float
     int layer_rows = model->batch_size * model->seq_len;
     size_t elem_offset = (size_t)layer_or_zero * layer_rows * qt->cols;
     size_t scale_offset = (size_t)layer_or_zero * (layer_rows / qt->group_m) * qt->num_group_cols;
-    aq_dequantize_fp8_rows_gpu(dst, qt->qvalues + elem_offset, qt->scales + scale_offset,
-                               layer_rows, qt->cols, qt->group_m, qt->group_n, stream);
+    if (model->aq_type == AQ_TYPE_INT8) {
+        aq_dequantize_int8_rows_gpu(dst, qt->qvalues + elem_offset, qt->scales + scale_offset,
+                                    layer_rows, qt->cols, qt->group_m, qt->group_n, stream);
+    } else {
+        aq_dequantize_fp8_rows_gpu(dst, qt->qvalues + elem_offset, qt->scales + scale_offset,
+                                   layer_rows, qt->cols, qt->group_m, qt->group_n, stream);
+    }
 }
 
 void gpt2_clear_ptq(GPT2 *model) {
@@ -3074,7 +3141,7 @@ void error_usage() {
     fprintf(stderr, "  --ptq_group_size <int> group size along cols for group-wise int4 quantization\n");
     fprintf(stderr, "                         (default = 128 when precision=int4, 0 = per-row otherwise)\n");
     fprintf(stderr, "  --aq <0|1>            enable activation quantization (default = 0)\n");
-    fprintf(stderr, "  --aq_type <str>       activation quantization type: fp8 (default = fp8)\n");
+    fprintf(stderr, "  --aq_type <str>       activation quantization type: fp8|int8 (default = fp8)\n");
     fprintf(stderr, "  --aq_group_size <int> group size for activation quantization (default = 32)\n");
     fprintf(stderr, "  --optim_quant <str>   optimizer state format: fp32|fp8|int8|int4 (default = fp32)\n");
     fprintf(stderr, "  --optim_group_size <int> group size for quantized moments (default = %d)\n", COAT_GROUP_SIZE);
@@ -3323,9 +3390,10 @@ int main(int argc, char *argv[]) {
     {
         AQType at = AQ_TYPE_NONE;
         if (aq_enabled) {
-            if (strcmp(aq_type_name, "fp8") == 0) at = AQ_TYPE_FP8;
+            if      (strcmp(aq_type_name, "fp8")  == 0) at = AQ_TYPE_FP8;
+            else if (strcmp(aq_type_name, "int8") == 0) at = AQ_TYPE_INT8;
             else {
-                fprintf(stderr, "Unknown --aq_type '%s'. Expected fp8.\n", aq_type_name);
+                fprintf(stderr, "Unknown --aq_type '%s'. Expected fp8|int8.\n", aq_type_name);
                 exit(EXIT_FAILURE);
             }
             if (aq_group_size <= 0) {
