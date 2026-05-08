@@ -7,9 +7,12 @@
 | `--ptq` | Weight quantization | `0` (off), `1` (on) |
 | `--ptq_precision` | Weight precision | `int8`, `fp8`, `int4` |
 | `--ptq_group_size` | Weight group size | any integer |
+| `--aq` | Activation quantization | `0` (off), `1` (on) |
+| `--aq_type` | Activation precision | `fp8`, `int8`, `int4` |
+| `--aq_group_size` | Activation group size | positive integer (square 2D groups) |
 
 ```bash
-./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64
+./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64 --aq 1 --aq_type int4 --aq_group_size 4
 ```
 
 ---
@@ -28,9 +31,9 @@ python run_experiments.py
 
 **Example (paste all at once):**
 ```
-./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64
-./train_gpt2cu --optim_quant int4 --optim_group_size 32 --ptq 1 --ptq_precision int4 --ptq_group_size 32
-./train_gpt2cu --optim_quant int4 --optim_group_size 16 --ptq 1 --ptq_precision int4 --ptq_group_size 16
+./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64 --aq 1 --aq_type fp8 --aq_group_size 4
+./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64 --aq 1 --aq_type int8 --aq_group_size 4
+./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64 --aq 1 --aq_type int4 --aq_group_size 4
 
 ```
 (blank line at the end to submit)
