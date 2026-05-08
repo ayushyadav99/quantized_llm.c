@@ -139,8 +139,11 @@ def mpath(sym, cx, cy, r=5):
 
 
 def write_svg(output_path, series, smooth_window, loss_label):
-    W, H = 1200, 720
-    L, R, T, B = 90, 260, 60, 75
+    H = 720
+    L, T, B = 90, 60, 75
+    max_label_chars = max((len(s["label"]) for s in series), default=10)
+    R = max(260, max_label_chars * 8 + 100)  # 8px/char + padding
+    W = L + 850 + R                           # keep plot area fixed at 850px
     PW, PH = W - L - R, H - T - B
 
     plot_series, all_xs, all_ys = [], [], []
