@@ -32,9 +32,9 @@ python run_experiments.py
 
 **Example (paste all at once):**
 ```
-./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64 --aq 1 --aq_type fp8 --aq_group_size 4
-./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64 --aq 1 --aq_type int8 --aq_group_size 4
-./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64 --aq 1 --aq_type int4 --aq_group_size 4
+./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64 --aq 1 --aq_type fp8 --aq_group_size 16 -x 300 -s 100 -v 100
+./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64 --aq 1 --aq_type int8 --aq_group_size 16 -x 300 -s 100 -v 100
+./train_gpt2cu --optim_quant int4 --optim_group_size 64 --ptq 1 --ptq_precision int4 --ptq_group_size 64 --aq 1 --aq_type int4 --aq_group_size 16 -x 300 -s 100 -v 100
 
 ```
 (blank line at the end to submit)
