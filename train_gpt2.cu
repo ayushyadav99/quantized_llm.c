@@ -62,6 +62,9 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/fused_classifier.cuh"
 // defines: adamw_kernel3
 #include "llmc/adamw.cuh"
+// defines: coat_quantize_group, coat_dequantize_group, coat_expand, coat_unexpand
+// pass --optim_quant fp8|int8|int4 at runtime to enable quantized optimizer states
+#include "llmc/coat_fp8_optim.cuh"
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
 // ----------- Multi-GPU support -----------
@@ -106,11 +109,16 @@ constexpr const int NUM_PARAMETER_TENSORS = 16;
 
 typedef struct {
     uint8_t* qvalues; // quantized payload, row-major. int4 stores two logical values per byte.
-    float* scales;    // one scale per output row
+    // Scales layout: [num_layers, rows_per_layer, num_groups] in row-major float.
+    // num_groups = cols / group_size. When group_size == cols this collapses to one
+    // scale per row (the default for int8/fp8). For int4 we typically use group_size < cols.
+    float* scales;
     int num_layers;
     int rows_per_layer;
     int cols;
+    int group_size;       // grouping along cols. Always in [1, cols] and divides cols.
     size_t qvalue_bytes;
+    size_t scale_count;   // total scales stored = num_layers * rows_per_layer * (cols/group_size)
     bool initialized;
 } QuantizedTensor;
 
@@ -149,10 +157,249 @@ __host__ __device__ inline size_t ptq_qvalue_bytes(size_t logical_elements, PTQP
     return precision == PTQ_PRECISION_INT4 ? (logical_elements + 1) / 2 : logical_elements;
 }
 
+// Resolve a user-supplied group size (0 = unset = per-row) against the actual cols
+// dimension of a tensor. Returns a value in [1, cols] that divides cols.
+inline int ptq_resolve_group_size(int requested_group_size, int cols) {
+    if (requested_group_size <= 0 || requested_group_size > cols) { return cols; }
+    if (cols % requested_group_size != 0) { return cols; }
+    return requested_group_size;
+}
+
+__host__ __device__ inline int ptq_num_groups(int cols, int group_size) {
+    return cols / group_size;
+}
+
 __host__ __device__ inline float ptq_decode_fp8_e4m3(uint8_t raw) {
     __nv_fp8_e4m3 value;
     value.__x = raw;
     return (float)value;
+}
+
+__global__ void ptq_write_scales_kernel(float* scales, const float* group_maxes,
+                                        size_t total_groups, float quant_max);
+__host__ __device__ uint8_t ptq_encode_fp8_e4m3(float value);
+
+__host__ __device__ inline size_t aq_scale_idx_2d(int row, int col, int num_group_cols, int group_m, int group_n) {
+    return (size_t)(row / group_m) * num_group_cols + (size_t)(col / group_n);
+}
+
+__global__ void aq_find_group_max_kernel(float* __restrict__ group_maxes,
+                                               const floatX* __restrict__ src,
+                                               int rows, int cols, int group_m, int group_n,
+                                               int num_group_cols) {
+    int gr = blockIdx.y;
+    int gc = blockIdx.x;
+    int row_begin = gr * group_m;
+    int col_begin = gc * group_n;
+    float local_max = 0.0f;
+    for (int r = threadIdx.x; r < group_m * group_n; r += blockDim.x) {
+        int rr = row_begin + (r / group_n);
+        int cc = col_begin + (r % group_n);
+        if (rr < rows && cc < cols) {
+            local_max = fmaxf(local_max, fabsf((float)src[(size_t)rr * cols + cc]));
+        }
+    }
+    __shared__ float sdata[256];
+    sdata[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        group_maxes[(size_t)gr * num_group_cols + gc] = sdata[0];
+    }
+}
+
+__global__ void aq_quantize_fp8_apply_kernel(uint8_t* __restrict__ dst,
+                                             const floatX* __restrict__ src,
+                                             const float* __restrict__ scales,
+                                             int rows, int cols,
+                                             int group_m, int group_n, int num_group_cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = rows * cols;
+    if (idx >= count) return;
+    int row = idx / cols;
+    int col = idx - row * cols;
+    float scale = scales[aq_scale_idx_2d(row, col, num_group_cols, group_m, group_n)];
+    float v = (float)src[idx] / scale;
+    dst[idx] = ptq_encode_fp8_e4m3(v);
+}
+
+__global__ void aq_dequantize_fp8_kernel(floatX* __restrict__ dst,
+                                         const uint8_t* __restrict__ src,
+                                         const float* __restrict__ scales,
+                                         int rows, int cols,
+                                         int group_m, int group_n, int num_group_cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = rows * cols;
+    if (idx >= count) return;
+    int row = idx / cols;
+    int col = idx - row * cols;
+    float scale = scales[aq_scale_idx_2d(row, col, num_group_cols, group_m, group_n)];
+    float q = ptq_decode_fp8_e4m3(src[idx]);
+    dst[idx] = (floatX)(scale * q);
+}
+
+void aq_quantize_fp8_rows_gpu(uint8_t* qdst, float* scales, float* group_maxes_scratch,
+                              const floatX* src, int rows, int cols, int group_m, int group_n,
+                              cudaStream_t stream) {
+    const int ngr = CEIL_DIV(rows, group_m);
+    const int ngc = CEIL_DIV(cols, group_n);
+    const size_t total_groups = (size_t)ngr * ngc;
+    dim3 grid(ngc, ngr);
+    aq_find_group_max_kernel<<<grid, 256, 0, stream>>>(group_maxes_scratch, src, rows, cols,
+                                                        group_m, group_n, ngc);
+    ptq_write_scales_kernel<<<CEIL_DIV(total_groups, (size_t)256), 256, 0, stream>>>(
+        scales, group_maxes_scratch, total_groups, FP8_E4M3_MAX);
+    int count = rows * cols;
+    aq_quantize_fp8_apply_kernel<<<CEIL_DIV(count, 256), 256, 0, stream>>>(
+        qdst, src, scales, rows, cols, group_m, group_n, ngc);
+}
+
+void aq_dequantize_fp8_rows_gpu(floatX* dst, const uint8_t* src, const float* scales,
+                                int rows, int cols, int group_m, int group_n,
+                                cudaStream_t stream) {
+    const int ngc = CEIL_DIV(cols, group_n);
+    int count = rows * cols;
+    aq_dequantize_fp8_kernel<<<CEIL_DIV(count, 256), 256, 0, stream>>>(
+        dst, src, scales, rows, cols, group_m, group_n, ngc);
+}
+
+constexpr float INT8_QUANT_MAX = 127.0f;
+
+__global__ void aq_quantize_int8_apply_kernel(uint8_t* __restrict__ dst,
+                                              const floatX* __restrict__ src,
+                                              const float* __restrict__ scales,
+                                              int rows, int cols,
+                                              int group_m, int group_n, int num_group_cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int row = idx / cols;
+    int col = idx - row * cols;
+    float scale = scales[aq_scale_idx_2d(row, col, num_group_cols, group_m, group_n)];
+    float v = (float)src[idx] / scale;
+    int8_t q = (int8_t)fmaxf(-INT8_QUANT_MAX, fminf(INT8_QUANT_MAX, rintf(v)));
+    dst[idx] = (uint8_t)q;
+}
+
+__global__ void aq_dequantize_int8_kernel(floatX* __restrict__ dst,
+                                          const uint8_t* __restrict__ src,
+                                          const float* __restrict__ scales,
+                                          int rows, int cols,
+                                          int group_m, int group_n, int num_group_cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int row = idx / cols;
+    int col = idx - row * cols;
+    float scale = scales[aq_scale_idx_2d(row, col, num_group_cols, group_m, group_n)];
+    dst[idx] = (floatX)((int8_t)src[idx] * scale);
+}
+
+void aq_quantize_int8_rows_gpu(uint8_t* qdst, float* scales, float* group_maxes_scratch,
+                               const floatX* src, int rows, int cols, int group_m, int group_n,
+                               cudaStream_t stream) {
+    const int ngr = CEIL_DIV(rows, group_m);
+    const int ngc = CEIL_DIV(cols, group_n);
+    const size_t total_groups = (size_t)ngr * ngc;
+    dim3 grid(ngc, ngr);
+    aq_find_group_max_kernel<<<grid, 256, 0, stream>>>(group_maxes_scratch, src, rows, cols,
+                                                       group_m, group_n, ngc);
+    ptq_write_scales_kernel<<<CEIL_DIV(total_groups, (size_t)256), 256, 0, stream>>>(
+        scales, group_maxes_scratch, total_groups, INT8_QUANT_MAX);
+    int count = rows * cols;
+    aq_quantize_int8_apply_kernel<<<CEIL_DIV(count, 256), 256, 0, stream>>>(
+        qdst, src, scales, rows, cols, group_m, group_n, ngc);
+}
+
+void aq_dequantize_int8_rows_gpu(floatX* dst, const uint8_t* src, const float* scales,
+                                 int rows, int cols, int group_m, int group_n,
+                                 cudaStream_t stream) {
+    const int ngc = CEIL_DIV(cols, group_n);
+    int count = rows * cols;
+    aq_dequantize_int8_kernel<<<CEIL_DIV(count, 256), 256, 0, stream>>>(
+        dst, src, scales, rows, cols, group_m, group_n, ngc);
+}
+
+constexpr float INT4_QUANT_MAX = 7.0f;
+
+__host__ __device__ inline int ptq_decode_int4_nibble(uint8_t nibble);
+__host__ __device__ inline uint8_t ptq_encode_int4_nibble(int value);
+__host__ __device__ inline uint8_t ptq_pack_int4_pair(int low, int high);
+
+// Each thread handles one packed byte (two logical INT4 elements).
+// Pairs are taken in flat row-major order; each element independently looks up its 2D group scale.
+__global__ void aq_quantize_int4_apply_kernel(uint8_t* __restrict__ dst,
+                                              const floatX* __restrict__ src,
+                                              const float* __restrict__ scales,
+                                              int rows, int cols,
+                                              int group_m, int group_n, int num_group_cols) {
+    const int byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int count = rows * cols;
+    const int idx0 = byte_idx * 2;
+    if (idx0 >= count) return;
+
+    const int row0 = idx0 / cols, col0 = idx0 - row0 * cols;
+    const float val0 = (float)src[idx0] / scales[aq_scale_idx_2d(row0, col0, num_group_cols, group_m, group_n)];
+    const int q0 = (int)lrintf(fmaxf(-INT4_QUANT_MAX, fminf(INT4_QUANT_MAX, val0)));
+
+    int q1 = 0;
+    const int idx1 = idx0 + 1;
+    if (idx1 < count) {
+        const int row1 = idx1 / cols, col1 = idx1 - row1 * cols;
+        const float val1 = (float)src[idx1] / scales[aq_scale_idx_2d(row1, col1, num_group_cols, group_m, group_n)];
+        q1 = (int)lrintf(fmaxf(-INT4_QUANT_MAX, fminf(INT4_QUANT_MAX, val1)));
+    }
+    dst[byte_idx] = ptq_pack_int4_pair(q0, q1);
+}
+
+__global__ void aq_dequantize_int4_kernel(floatX* __restrict__ dst,
+                                          const uint8_t* __restrict__ src,
+                                          const float* __restrict__ scales,
+                                          int rows, int cols,
+                                          int group_m, int group_n, int num_group_cols) {
+    const int byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int count = rows * cols;
+    const int idx0 = byte_idx * 2;
+    if (idx0 >= count) return;
+
+    const uint8_t packed = src[byte_idx];
+
+    const int row0 = idx0 / cols, col0 = idx0 - row0 * cols;
+    const float scale0 = scales[aq_scale_idx_2d(row0, col0, num_group_cols, group_m, group_n)];
+    dst[idx0] = (floatX)(ptq_decode_int4_nibble(packed & 0x0F) * scale0);
+
+    const int idx1 = idx0 + 1;
+    if (idx1 < count) {
+        const int row1 = idx1 / cols, col1 = idx1 - row1 * cols;
+        const float scale1 = scales[aq_scale_idx_2d(row1, col1, num_group_cols, group_m, group_n)];
+        dst[idx1] = (floatX)(ptq_decode_int4_nibble(packed >> 4) * scale1);
+    }
+}
+
+void aq_quantize_int4_rows_gpu(uint8_t* qdst, float* scales, float* group_maxes_scratch,
+                               const floatX* src, int rows, int cols, int group_m, int group_n,
+                               cudaStream_t stream) {
+    const int ngr = CEIL_DIV(rows, group_m);
+    const int ngc = CEIL_DIV(cols, group_n);
+    const size_t total_groups = (size_t)ngr * ngc;
+    dim3 grid(ngc, ngr);
+    aq_find_group_max_kernel<<<grid, 256, 0, stream>>>(group_maxes_scratch, src, rows, cols,
+                                                       group_m, group_n, ngc);
+    ptq_write_scales_kernel<<<CEIL_DIV(total_groups, (size_t)256), 256, 0, stream>>>(
+        scales, group_maxes_scratch, total_groups, INT4_QUANT_MAX);
+    const int qbytes = ((size_t)rows * cols + 1) / 2;
+    aq_quantize_int4_apply_kernel<<<CEIL_DIV(qbytes, 256), 256, 0, stream>>>(
+        qdst, src, scales, rows, cols, group_m, group_n, ngc);
+}
+
+void aq_dequantize_int4_rows_gpu(floatX* dst, const uint8_t* src, const float* scales,
+                                 int rows, int cols, int group_m, int group_n,
+                                 cudaStream_t stream) {
+    const int ngc = CEIL_DIV(cols, group_n);
+    const int qbytes = ((size_t)rows * cols + 1) / 2;
+    aq_dequantize_int4_kernel<<<CEIL_DIV(qbytes, 256), 256, 0, stream>>>(
+        dst, src, scales, rows, cols, group_m, group_n, ngc);
 }
 
 __host__ __device__ inline int ptq_decode_int4_nibble(uint8_t nibble) {
@@ -191,17 +438,26 @@ __host__ __device__ uint8_t ptq_encode_fp8_e4m3(float value) {
     return __nv_fp8_e4m3(value).__x;
 }
 
-void ptq_quantize_rows_host(uint8_t* dst, float* scales, const float* src, int rows, int cols, PTQPrecision precision) {
+// Host-side reference quantizer. group_size in [1, cols] and must divide cols.
+// scales has shape [rows, num_groups] with num_groups = cols/group_size.
+// Pass group_size == cols for per-row behavior (degenerate single-group case).
+void ptq_quantize_rows_host(uint8_t* dst, float* scales, const float* src, int rows, int cols,
+                            int group_size, PTQPrecision precision) {
     assert(ptq_precision_is_supported(precision));
+    assert(group_size >= 1 && group_size <= cols && cols % group_size == 0);
     const float quant_max = ptq_quant_max(precision);
+    const int num_groups = ptq_num_groups(cols, group_size);
     for (int row = 0; row < rows; ++row) {
         const float* row_src = src + row * cols;
-        float max_abs = 0.0f;
-        for (int col = 0; col < cols; ++col) {
-            max_abs = fmaxf(max_abs, fabsf(row_src[col]));
+        for (int g = 0; g < num_groups; ++g) {
+            const int col_begin = g * group_size;
+            float max_abs = 0.0f;
+            for (int k = 0; k < group_size; ++k) {
+                max_abs = fmaxf(max_abs, fabsf(row_src[col_begin + k]));
+            }
+            const float scale = max_abs > 0.0f ? max_abs / quant_max : 1.0f;
+            scales[(size_t)row * num_groups + g] = scale;
         }
-        float scale = max_abs > 0.0f ? max_abs / quant_max : 1.0f;
-        scales[row] = scale;
     }
 
     if (precision == PTQ_PRECISION_INT4) {
@@ -210,8 +466,9 @@ void ptq_quantize_rows_host(uint8_t* dst, float* scales, const float* src, int r
 
     for (int row = 0; row < rows; ++row) {
         const float* row_src = src + row * cols;
-        const float scale = scales[row];
         for (int col = 0; col < cols; ++col) {
+            const int g = col / group_size;
+            const float scale = scales[(size_t)row * num_groups + g];
             const float scaled = row_src[col] / scale;
             if (precision == PTQ_PRECISION_INT8) {
                 const int q = (int)lrintf(fmaxf(-127.0f, fminf(127.0f, scaled)));
@@ -232,11 +489,15 @@ void ptq_quantize_rows_host(uint8_t* dst, float* scales, const float* src, int r
     }
 }
 
-void ptq_dequantize_rows_host(float* dst, const uint8_t* src, const float* scales, int rows, int cols, PTQPrecision precision) {
+void ptq_dequantize_rows_host(float* dst, const uint8_t* src, const float* scales, int rows, int cols,
+                              int group_size, PTQPrecision precision) {
     assert(ptq_precision_is_supported(precision));
+    assert(group_size >= 1 && group_size <= cols && cols % group_size == 0);
+    const int num_groups = ptq_num_groups(cols, group_size);
     for (int row = 0; row < rows; ++row) {
-        const float scale = scales[row];
         for (int col = 0; col < cols; ++col) {
+            const int g = col / group_size;
+            const float scale = scales[(size_t)row * num_groups + g];
             const size_t idx = (size_t)row * cols + col;
             const float q = ptq_unpack_decode_value(src, idx, precision);
             dst[idx] = scale * q;
@@ -244,39 +505,51 @@ void ptq_dequantize_rows_host(float* dst, const uint8_t* src, const float* scale
     }
 }
 
+// Dequantize with group-wise scales. scales has shape [rows, num_groups] where
+// num_groups = cols / group_size. Pass group_size == cols for the per-row case.
 __global__ void ptq_dequantize_rows_kernel(floatX* dst, const uint8_t* src, const float* scales,
-                                           int rows, int cols, PTQPrecision precision) {
+                                           int rows, int cols, int group_size, PTQPrecision precision) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int count = rows * cols;
     if (idx >= count) { return; }
     const int row = idx / cols;
+    const int col = idx - row * cols;
+    const int num_groups = cols / group_size;
+    const int g = col / group_size;
     const float q = ptq_unpack_decode_value(src, (size_t)idx, precision);
-    dst[idx] = (floatX)(scales[row] * q);
+    dst[idx] = (floatX)(scales[(size_t)row * num_groups + g] * q);
 }
 
 void ptq_dequantize_rows(floatX* dst, const uint8_t* src, const float* scales, int rows, int cols,
-                         PTQPrecision precision, cudaStream_t stream) {
+                         int group_size, PTQPrecision precision, cudaStream_t stream) {
     const int count = rows * cols;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(count, block_size);
-    ptq_dequantize_rows_kernel<<<grid_size, block_size, 0, stream>>>(dst, src, scales, rows, cols, precision);
+    ptq_dequantize_rows_kernel<<<grid_size, block_size, 0, stream>>>(dst, src, scales, rows, cols,
+                                                                     group_size, precision);
     cudaCheck(cudaGetLastError());
 }
 
 // ----------------------------------------------------------------------------
-// GPU-side row-wise quantization (beast mode: no host round-trip)
+// GPU-side group-wise quantization (beast mode: no host round-trip).
+// "Per-row" is the degenerate case group_size == cols, num_groups == 1, and
+// every kernel below collapses to identical work to the original row-wise path.
 
-// Pass 1a: find max |value| per row, floatX source.
-// One block per row, 256 threads cooperate via shared-memory reduction.
-__global__ void ptq_find_row_max_kernel(float* __restrict__ row_maxes,
-                                        const floatX* __restrict__ src,
-                                        int rows, int cols) {
-    int row = blockIdx.x;
+// Pass 1a: find max |value| per (row, group), floatX source.
+// One block per group: grid = (num_groups, rows). 256 threads stride over group_size
+// values and reduce in shared memory.
+__global__ void ptq_find_group_max_kernel(float* __restrict__ group_maxes,
+                                          const floatX* __restrict__ src,
+                                          int rows, int cols, int group_size) {
+    const int g = blockIdx.x;
+    const int row = blockIdx.y;
     if (row >= rows) return;
+    const int num_groups = cols / group_size;
+    const int col_begin = g * group_size;
     const floatX* row_src = src + (size_t)row * cols;
     float local_max = 0.0f;
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        local_max = fmaxf(local_max, fabsf((float)row_src[col]));
+    for (int k = threadIdx.x; k < group_size; k += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf((float)row_src[col_begin + k]));
     }
     __shared__ float sdata[256];
     sdata[threadIdx.x] = local_max;
@@ -286,19 +559,22 @@ __global__ void ptq_find_row_max_kernel(float* __restrict__ row_maxes,
             sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
         __syncthreads();
     }
-    if (threadIdx.x == 0) row_maxes[row] = sdata[0];
+    if (threadIdx.x == 0) group_maxes[(size_t)row * num_groups + g] = sdata[0];
 }
 
 // Pass 1b: same but from FP32 source (used when re-quantizing from master_weights).
-__global__ void ptq_find_row_max_fp32_kernel(float* __restrict__ row_maxes,
-                                              const float* __restrict__ src,
-                                              int rows, int cols) {
-    int row = blockIdx.x;
+__global__ void ptq_find_group_max_fp32_kernel(float* __restrict__ group_maxes,
+                                                const float* __restrict__ src,
+                                                int rows, int cols, int group_size) {
+    const int g = blockIdx.x;
+    const int row = blockIdx.y;
     if (row >= rows) return;
+    const int num_groups = cols / group_size;
+    const int col_begin = g * group_size;
     const float* row_src = src + (size_t)row * cols;
     float local_max = 0.0f;
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        local_max = fmaxf(local_max, fabsf(row_src[col]));
+    for (int k = threadIdx.x; k < group_size; k += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(row_src[col_begin + k]));
     }
     __shared__ float sdata[256];
     sdata[threadIdx.x] = local_max;
@@ -308,27 +584,36 @@ __global__ void ptq_find_row_max_fp32_kernel(float* __restrict__ row_maxes,
             sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
         __syncthreads();
     }
-    if (threadIdx.x == 0) row_maxes[row] = sdata[0];
+    if (threadIdx.x == 0) group_maxes[(size_t)row * num_groups + g] = sdata[0];
 }
 
-// Pass 1c: convert row_maxes → scales.
-__global__ void ptq_write_scales_kernel(float* scales, const float* row_maxes,
-                                        int rows, float quant_max) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
-    float m = row_maxes[row];
-    scales[row] = (m > 0.0f) ? (m / quant_max) : 1.0f;
+// Pass 1c: convert group_maxes -> scales (one element per group).
+__global__ void ptq_write_scales_kernel(float* scales, const float* group_maxes,
+                                        size_t total_groups, float quant_max) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_groups) return;
+    float m = group_maxes[idx];
+    scales[idx] = (m > 0.0f) ? (m / quant_max) : 1.0f;
 }
 
-// Pass 2a: quantize from floatX using precomputed scales.
+// Index helper: scale index for a given (row, col) under group_size.
+// scales has layout [rows, num_groups] with num_groups = cols / group_size.
+__host__ __device__ inline size_t ptq_scale_idx(int row, int col, int cols, int group_size) {
+    const int num_groups = cols / group_size;
+    return (size_t)row * num_groups + (col / group_size);
+}
+
+// Pass 2a: quantize from floatX using precomputed group-wise scales.
 __global__ void ptq_quantize_apply_kernel(uint8_t* __restrict__ dst,
                                           const floatX* __restrict__ src,
                                           const float* __restrict__ scales,
-                                          int rows, int cols, PTQPrecision precision) {
+                                          int rows, int cols, int group_size,
+                                          PTQPrecision precision) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= rows * cols) return;
     int row = idx / cols;
-    float val = (float)src[idx] / scales[row];
+    int col = idx - row * cols;
+    float val = (float)src[idx] / scales[ptq_scale_idx(row, col, cols, group_size)];
     if (precision == PTQ_PRECISION_INT8) {
         int q = (int)lrintf(fmaxf(-127.0f, fminf(127.0f, val)));
         dst[idx] = (uint8_t)((int8_t)q);
@@ -340,35 +625,39 @@ __global__ void ptq_quantize_apply_kernel(uint8_t* __restrict__ dst,
 __global__ void ptq_quantize_apply_int4_kernel(uint8_t* __restrict__ dst,
                                                const floatX* __restrict__ src,
                                                const float* __restrict__ scales,
-                                               int rows, int cols) {
+                                               int rows, int cols, int group_size) {
     const int byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int count = rows * cols;
     const int idx0 = byte_idx * 2;
     if (idx0 >= count) return;
 
     const int row0 = idx0 / cols;
-    const float val0 = (float)src[idx0] / scales[row0];
+    const int col0 = idx0 - row0 * cols;
+    const float val0 = (float)src[idx0] / scales[ptq_scale_idx(row0, col0, cols, group_size)];
     const int q0 = (int)lrintf(fmaxf(-7.0f, fminf(7.0f, val0)));
 
     int q1 = 0;
     const int idx1 = idx0 + 1;
     if (idx1 < count) {
         const int row1 = idx1 / cols;
-        const float val1 = (float)src[idx1] / scales[row1];
+        const int col1 = idx1 - row1 * cols;
+        const float val1 = (float)src[idx1] / scales[ptq_scale_idx(row1, col1, cols, group_size)];
         q1 = (int)lrintf(fmaxf(-7.0f, fminf(7.0f, val1)));
     }
     dst[byte_idx] = ptq_pack_int4_pair(q0, q1);
 }
 
-// Pass 2b: quantize from FP32 using precomputed scales.
+// Pass 2b: quantize from FP32 using precomputed group-wise scales.
 __global__ void ptq_quantize_apply_fp32_kernel(uint8_t* __restrict__ dst,
                                                const float* __restrict__ src,
                                                const float* __restrict__ scales,
-                                               int rows, int cols, PTQPrecision precision) {
+                                               int rows, int cols, int group_size,
+                                               PTQPrecision precision) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= rows * cols) return;
     int row = idx / cols;
-    float val = src[idx] / scales[row];
+    int col = idx - row * cols;
+    float val = src[idx] / scales[ptq_scale_idx(row, col, cols, group_size)];
     if (precision == PTQ_PRECISION_INT8) {
         int q = (int)lrintf(fmaxf(-127.0f, fminf(127.0f, val)));
         dst[idx] = (uint8_t)((int8_t)q);
@@ -380,64 +669,77 @@ __global__ void ptq_quantize_apply_fp32_kernel(uint8_t* __restrict__ dst,
 __global__ void ptq_quantize_apply_int4_fp32_kernel(uint8_t* __restrict__ dst,
                                                     const float* __restrict__ src,
                                                     const float* __restrict__ scales,
-                                                    int rows, int cols) {
+                                                    int rows, int cols, int group_size) {
     const int byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int count = rows * cols;
     const int idx0 = byte_idx * 2;
     if (idx0 >= count) return;
 
     const int row0 = idx0 / cols;
-    const float val0 = src[idx0] / scales[row0];
+    const int col0 = idx0 - row0 * cols;
+    const float val0 = src[idx0] / scales[ptq_scale_idx(row0, col0, cols, group_size)];
     const int q0 = (int)lrintf(fmaxf(-7.0f, fminf(7.0f, val0)));
 
     int q1 = 0;
     const int idx1 = idx0 + 1;
     if (idx1 < count) {
         const int row1 = idx1 / cols;
-        const float val1 = src[idx1] / scales[row1];
+        const int col1 = idx1 - row1 * cols;
+        const float val1 = src[idx1] / scales[ptq_scale_idx(row1, col1, cols, group_size)];
         q1 = (int)lrintf(fmaxf(-7.0f, fminf(7.0f, val1)));
     }
     dst[byte_idx] = ptq_pack_int4_pair(q0, q1);
 }
 
-// GPU quantize from floatX. row_maxes_scratch is a caller-owned device buffer of `rows` floats.
-void ptq_quantize_rows_gpu(uint8_t* dst, float* scales, float* row_maxes_scratch,
-                            const floatX* src, int rows, int cols,
+// GPU quantize from floatX. group_maxes_scratch: caller-owned device buffer with capacity for
+// `rows * (cols/group_size)` floats. group_size must divide cols and be in [1, cols].
+void ptq_quantize_rows_gpu(uint8_t* dst, float* scales, float* group_maxes_scratch,
+                            const floatX* src, int rows, int cols, int group_size,
                             PTQPrecision precision, cudaStream_t stream) {
+    assert(group_size >= 1 && group_size <= cols && cols % group_size == 0);
     const float quant_max = ptq_quant_max(precision);
-    ptq_find_row_max_kernel<<<rows, 256, 0, stream>>>(row_maxes_scratch, src, rows, cols);
+    const int num_groups = ptq_num_groups(cols, group_size);
+    const size_t total_groups = (size_t)rows * num_groups;
+    dim3 max_grid(num_groups, rows);
+    ptq_find_group_max_kernel<<<max_grid, 256, 0, stream>>>(group_maxes_scratch, src,
+                                                            rows, cols, group_size);
     cudaCheck(cudaGetLastError());
-    ptq_write_scales_kernel<<<CEIL_DIV(rows, 256), 256, 0, stream>>>(
-        scales, row_maxes_scratch, rows, quant_max);
+    ptq_write_scales_kernel<<<CEIL_DIV(total_groups, (size_t)256), 256, 0, stream>>>(
+        scales, group_maxes_scratch, total_groups, quant_max);
     cudaCheck(cudaGetLastError());
     if (precision == PTQ_PRECISION_INT4) {
         const int qbytes = (int)ptq_qvalue_bytes((size_t)rows * cols, precision);
         ptq_quantize_apply_int4_kernel<<<CEIL_DIV(qbytes, 256), 256, 0, stream>>>(
-            dst, src, scales, rows, cols);
+            dst, src, scales, rows, cols, group_size);
     } else {
         ptq_quantize_apply_kernel<<<CEIL_DIV(rows * cols, 256), 256, 0, stream>>>(
-            dst, src, scales, rows, cols, precision);
+            dst, src, scales, rows, cols, group_size, precision);
     }
     cudaCheck(cudaGetLastError());
 }
 
-// GPU quantize from FP32 master weights. row_maxes_scratch: device buffer of `rows` floats.
-void ptq_quantize_rows_gpu_fp32(uint8_t* dst, float* scales, float* row_maxes_scratch,
-                                const float* src, int rows, int cols,
+// GPU quantize from FP32 master weights. Same group_maxes_scratch sizing as above.
+void ptq_quantize_rows_gpu_fp32(uint8_t* dst, float* scales, float* group_maxes_scratch,
+                                const float* src, int rows, int cols, int group_size,
                                 PTQPrecision precision, cudaStream_t stream) {
+    assert(group_size >= 1 && group_size <= cols && cols % group_size == 0);
     const float quant_max = ptq_quant_max(precision);
-    ptq_find_row_max_fp32_kernel<<<rows, 256, 0, stream>>>(row_maxes_scratch, src, rows, cols);
+    const int num_groups = ptq_num_groups(cols, group_size);
+    const size_t total_groups = (size_t)rows * num_groups;
+    dim3 max_grid(num_groups, rows);
+    ptq_find_group_max_fp32_kernel<<<max_grid, 256, 0, stream>>>(group_maxes_scratch, src,
+                                                                  rows, cols, group_size);
     cudaCheck(cudaGetLastError());
-    ptq_write_scales_kernel<<<CEIL_DIV(rows, 256), 256, 0, stream>>>(
-        scales, row_maxes_scratch, rows, quant_max);
+    ptq_write_scales_kernel<<<CEIL_DIV(total_groups, (size_t)256), 256, 0, stream>>>(
+        scales, group_maxes_scratch, total_groups, quant_max);
     cudaCheck(cudaGetLastError());
     if (precision == PTQ_PRECISION_INT4) {
         const int qbytes = (int)ptq_qvalue_bytes((size_t)rows * cols, precision);
         ptq_quantize_apply_int4_fp32_kernel<<<CEIL_DIV(qbytes, 256), 256, 0, stream>>>(
-            dst, src, scales, rows, cols);
+            dst, src, scales, rows, cols, group_size);
     } else {
         ptq_quantize_apply_fp32_kernel<<<CEIL_DIV(rows * cols, 256), 256, 0, stream>>>(
-            dst, src, scales, rows, cols, precision);
+            dst, src, scales, rows, cols, group_size, precision);
     }
     cudaCheck(cudaGetLastError());
 }
@@ -448,13 +750,15 @@ void ptq_dequantize_layer_slice(floatX* dst, const QuantizedTensor* qt,
                                 int layer, PTQPrecision precision, cudaStream_t stream) {
     const int rows = qt->rows_per_layer;
     const int cols = qt->cols;
+    const int group_size = qt->group_size;
+    const int num_groups = ptq_num_groups(cols, group_size);
     assert(precision != PTQ_PRECISION_INT4 || (((size_t)rows * cols) % 2 == 0));
     const size_t elem_offset  = (size_t)layer * rows * cols;
-    const size_t scale_offset = (size_t)layer * rows;
+    const size_t scale_offset = (size_t)layer * rows * num_groups;
     ptq_dequantize_rows(dst,
                         qt->qvalues + ptq_qvalue_bytes(elem_offset, precision),
                         qt->scales  + scale_offset,
-                        rows, cols, precision, stream);
+                        rows, cols, group_size, precision, stream);
 }
 
 typedef struct {
@@ -490,11 +794,50 @@ typedef struct {
     bool initialized;
 } QuantizedParameters;
 
+enum AQType {
+    AQ_TYPE_NONE = 0,
+    AQ_TYPE_FP8  = 1,
+    AQ_TYPE_INT8 = 2,
+    AQ_TYPE_INT4 = 3,
+};
+
+typedef struct {
+    uint8_t* qvalues; // one FP8 value per element
+    float* scales;    // one scale per matrix group
+    int rows;
+    int cols;
+    int group_m;
+    int group_n;
+    int num_group_rows;
+    int num_group_cols;
+    size_t qvalue_count;
+    size_t scale_count;
+    bool initialized;
+} QuantizedActivationTensor;
+
+constexpr int NUM_AQ_TENSORS = 7;
+typedef struct {
+    QuantizedActivationTensor tensors[NUM_AQ_TENSORS];
+    bool initialized;
+} QuantizedActivations;
+
 typedef struct {
     int num_layers;
     int rows_per_layer;
     int cols;
 } PTQTensorLayout;
+
+enum AQTensorId {
+    AQ_TENSOR_LN1 = 0,
+    AQ_TENSOR_ATTY = 1,
+    AQ_TENSOR_RESIDUAL2 = 2,
+    AQ_TENSOR_LN2 = 3,
+    AQ_TENSOR_FCH = 4,
+    AQ_TENSOR_FCH_GELU = 5,
+    AQ_TENSOR_QKVR = 6,
+};
+
+typedef struct GPT2 GPT2;
 
 void get_parameter_tensor_ptrs(ParameterTensors* params, floatX** ptrs[NUM_PARAMETER_TENSORS]) {
     ptrs[0] = &params->wte;
@@ -672,7 +1015,7 @@ struct TensorSpec {
 
 #define TENSOR_SPEC(pointer, size) TensorSpec{(void**)(&pointer), (size), dtype_of(pointer)};
 
-void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t B, size_t T, GPT2Config config, int recompute) {
+void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t B, size_t T, GPT2Config config, int recompute, bool aq_enabled) {
     size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
@@ -691,12 +1034,12 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     #endif
     tensors[6] = TENSOR_SPEC(data->residual2, L * B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
-    tensors[7] = TENSOR_SPEC(data->ln2, (recompute < 2) ? L * B * T * C : 0);
+    tensors[7] = TENSOR_SPEC(data->ln2, (recompute < 2 && !aq_enabled) ? L * B * T * C : 0);
     tensors[8] = TENSOR_SPEC(data->ln2_mean, L * B * T);
     tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
     tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
+    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? (aq_enabled ? 0 : L * B * T * 4*C) : B * T * 4*C);
     tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
     tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
@@ -709,13 +1052,21 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
 }
 
-void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
+void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS], size_t aq_extra_bytes = 0) {
     size_t bytes = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         bytes += tensors[i].size * sizeof_dtype(tensors[i].type);
     }
 
-    printf0("allocating %d MiB for activations\n", (int)round(bytes / (1024 * 1024)));
+    const size_t total_bytes = bytes + aq_extra_bytes;
+    if (aq_extra_bytes > 0) {
+        printf0("allocating %d MiB for activations (+%d MiB AQ, total %d MiB)\n",
+                (int)round(bytes / (1024 * 1024)),
+                (int)round(aq_extra_bytes / (1024 * 1024)),
+                (int)round(total_bytes / (1024 * 1024)));
+    } else {
+        printf0("allocating %d MiB for activations\n", (int)round(bytes / (1024 * 1024)));
+    }
 
     void* acts_memory;
     cudaCheck(cudaMalloc((void**)&acts_memory, bytes));
@@ -739,6 +1090,18 @@ void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]
 }
 
 typedef struct {
+    int rows;
+    int cols;
+} AQTensorLayout;
+
+size_t aq_estimate_activation_bytes(const GPT2* model);
+AQTensorLayout aq_tensor_layout_for_id(const GPT2* model, int aq_id);
+floatX* aq_tensor_ptr_for_id(const GPT2* model, int aq_id);
+void gpt2_prepare_aq(GPT2* model);
+void aq_quantize_tensor_slice(GPT2* model, int aq_id, int layer_or_zero, const floatX* src, cudaStream_t stream);
+void aq_dequantize_tensor_slice(GPT2* model, int aq_id, int layer_or_zero, floatX* dst, cudaStream_t stream);
+
+struct GPT2 {
     GPT2Config config;
     // the weights of the model, and their sizes
     ParameterTensors params;
@@ -750,10 +1113,22 @@ typedef struct {
     // gradients of the weights
     ParameterTensors grads;
     void* grads_memory;
-    // AdamW moments always stay in FP32. This is one half of the "mixed precision"
-    // story here: forward/backward mostly use floatX, optimizer state stays float.
-    float* m_memory;
+    // AdamW optimizer state.
+    // optim_quant=0 (fp32): FP32 first (m) and second (v) moments — standard mixed precision.
+    // optim_quant=1/2/3 (fp8/int8/int4): m_memory/v_memory are always nullptr; quantized layout is active.
+    // optim_quant: 0=fp32, 1=fp8(COAT), 2=int8, 3=int4
+    int optim_quant;
+    int optim_group_size; // group size for quantized moments (all modes)
+    float* m_memory;      // FP32 moments (optim_quant==0 only)
     float* v_memory;
+    // Quantized moment storage (optim_quant 1/2/3). Reused across formats:
+    //   fp8/int8: 1 byte/param   int4: 0.5 bytes/param (nibble-packed)
+    uint8_t* m_qstate;
+    uint8_t* v_qstate;
+    float*   m_scales;    // absmax scale, one float per group
+    float*   v_scales;
+    float*   m_kfactors;  // COAT expansion exponent k, one float per group (all quantized modes)
+    float*   v_kfactors;
     float* master_weights;     // optional FP32 copy of params used for numerically safer updates
     // the activations of the model, and their sizes
     ActivationTensors acts;
@@ -773,12 +1148,24 @@ typedef struct {
     bool init_state;   // set to true if master weights need to be initialized
     int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
+    int aq_enabled;
+    AQType aq_type;
+    int aq_group_size;
+    QuantizedActivations aq;
+    floatX* aq_scratch;
+    size_t aq_scratch_elems;
+    float* aq_group_maxes_scratch;
+    size_t aq_group_maxes_scratch_elems;
     // Beast-mode PTQ: quantized storage for large transformer weight matrices.
     // params.qkvw / attprojw / fcw / fcprojw are NULL at runtime;
     // they live in ptq.tensors[i] as (qvalues + scales) and are dequantized
     // on-demand per-layer into scratch_dequant during forward/backward.
     int ptq_enabled;
     PTQPrecision ptq_precision;
+    // Requested group size along the cols axis for grouped quantization (int4 in particular).
+    // 0 = "unset" => per-row. Per-tensor effective group size is resolved against cols and
+    // stored in QuantizedTensor::group_size.
+    int ptq_group_size;
     QuantizedParameters ptq;
     // Per-layer dequant scratch: large enough for the biggest single-layer quantized weight
     // (fcw/fcprojw = 4*C*C floatX). Reused every layer, every step.
@@ -791,7 +1178,199 @@ typedef struct {
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
-} GPT2;
+};
+
+size_t aq_estimate_activation_bytes(const GPT2* model) {
+    if (!model->aq_enabled || model->aq_type != AQ_TYPE_FP8 || model->aq_group_size <= 0) {
+        return 0;
+    }
+    size_t qvalue_bytes = 0;
+    size_t scale_bytes = 0;
+    size_t max_elems = 0;
+    size_t max_groups = 0;
+    for (int i = 0; i < NUM_AQ_TENSORS; ++i) {
+        AQTensorLayout lo = aq_tensor_layout_for_id(model, i);
+        if (lo.rows % model->aq_group_size != 0 || lo.cols % model->aq_group_size != 0) {
+            return 0;
+        }
+        const size_t elems = (size_t)lo.rows * lo.cols;
+        const size_t groups = (size_t)(lo.rows / model->aq_group_size) * (size_t)(lo.cols / model->aq_group_size);
+        qvalue_bytes += elems * sizeof(uint8_t);
+        scale_bytes += groups * sizeof(float);
+        if (elems > max_elems) max_elems = elems;
+        if (groups > max_groups) max_groups = groups;
+    }
+    const size_t scratch_bytes = max_elems * sizeof(floatX);
+    const size_t group_scratch_bytes = max_groups * sizeof(float);
+    return qvalue_bytes + scale_bytes + scratch_bytes + group_scratch_bytes;
+}
+
+AQTensorLayout aq_tensor_layout_for_id(const GPT2* model, int aq_id) {
+    const int L = model->config.num_layers;
+    const int B = model->batch_size;
+    const int T = model->seq_len;
+    const int C = model->config.channels;
+    switch (aq_id) {
+        case AQ_TENSOR_LN1:       return {(model->recompute < 2) ? L * B * T : B * T, C};
+        case AQ_TENSOR_ATTY:      return {L * B * T, C};
+        case AQ_TENSOR_RESIDUAL2: return {L * B * T, C};
+        case AQ_TENSOR_LN2:       return {(model->recompute < 2) ? L * B * T : B * T, C};
+        case AQ_TENSOR_FCH:       return {L * B * T, 4 * C};
+        case AQ_TENSOR_FCH_GELU:  return {(model->recompute < 1) ? L * B * T : B * T, 4 * C};
+        case AQ_TENSOR_QKVR:      return {L * B * T, 3 * C};
+        default:
+            fprintf(stderr, "Invalid AQ tensor id %d\n", aq_id);
+            exit(EXIT_FAILURE);
+    }
+}
+
+floatX* aq_tensor_ptr_for_id(const GPT2* model, int aq_id) {
+    switch (aq_id) {
+        case AQ_TENSOR_LN1: return model->acts.ln1;
+        case AQ_TENSOR_ATTY: return model->acts.atty;
+        case AQ_TENSOR_RESIDUAL2: return model->acts.residual2;
+        case AQ_TENSOR_LN2: return model->acts.ln2;
+        case AQ_TENSOR_FCH: return model->acts.fch;
+        case AQ_TENSOR_FCH_GELU: return model->acts.fch_gelu;
+        case AQ_TENSOR_QKVR: return model->acts.qkvr;
+        default: return nullptr;
+    }
+}
+
+void gpt2_prepare_aq(GPT2* model) {
+    if (!model->aq_enabled) {
+        for (int i = 0; i < NUM_AQ_TENSORS; ++i) {
+            cudaFreeCheck(&model->aq.tensors[i].qvalues);
+            cudaFreeCheck(&model->aq.tensors[i].scales);
+            model->aq.tensors[i] = {};
+        }
+        model->aq.initialized = false;
+        return;
+    }
+    if (model->aq_type != AQ_TYPE_FP8 && model->aq_type != AQ_TYPE_INT8 && model->aq_type != AQ_TYPE_INT4) {
+        fprintf(stderr, "AQ type not supported. Expected fp8, int8, or int4.\n");
+        exit(EXIT_FAILURE);
+    }
+    if (model->aq_group_size <= 0) {
+        fprintf(stderr, "AQ group size must be positive.\n");
+        exit(EXIT_FAILURE);
+    }
+    size_t max_elems = 0;
+    size_t max_groups = 0;
+    for (int i = 0; i < NUM_AQ_TENSORS; ++i) {
+        AQTensorLayout lo = aq_tensor_layout_for_id(model, i);
+        if (lo.rows % model->aq_group_size != 0 || lo.cols % model->aq_group_size != 0) {
+            fprintf(stderr, "AQ square group size %d must divide tensor %d shape (%d,%d)\n",
+                    model->aq_group_size, i, lo.rows, lo.cols);
+            exit(EXIT_FAILURE);
+        }
+        size_t elems = (size_t)lo.rows * lo.cols;
+        if (model->aq_type == AQ_TYPE_INT4 && elems % 2 != 0) {
+            fprintf(stderr, "AQ INT4: tensor %d has odd element count (%zu) — cannot nibble-pack\n", i, elems);
+            exit(EXIT_FAILURE);
+        }
+        int ngr = lo.rows / model->aq_group_size;
+        int ngc = lo.cols / model->aq_group_size;
+        size_t groups = (size_t)ngr * ngc;
+        if (elems > max_elems) max_elems = elems;
+        if (groups > max_groups) max_groups = groups;
+
+        QuantizedActivationTensor* qt = &model->aq.tensors[i];
+        if (qt->initialized && (qt->qvalue_count != elems || qt->scale_count != groups)) {
+            cudaFreeCheck(&qt->qvalues);
+            cudaFreeCheck(&qt->scales);
+            *qt = {};
+        }
+        if (!qt->initialized) {
+            // INT4 packs two logical values per byte
+            size_t qbytes = (model->aq_type == AQ_TYPE_INT4) ? (elems + 1) / 2 : elems;
+            cudaCheck(cudaMalloc((void**)&qt->qvalues, qbytes * sizeof(uint8_t)));
+            cudaCheck(cudaMalloc((void**)&qt->scales, groups * sizeof(float)));
+            qt->rows = lo.rows;
+            qt->cols = lo.cols;
+            qt->group_m = model->aq_group_size;
+            qt->group_n = model->aq_group_size;
+            qt->num_group_rows = ngr;
+            qt->num_group_cols = ngc;
+            qt->qvalue_count = elems;
+            qt->scale_count = groups;
+            qt->initialized = true;
+        }
+    }
+    if (model->aq_scratch == nullptr || model->aq_scratch_elems < max_elems) {
+        cudaFreeCheck(&model->aq_scratch);
+        cudaCheck(cudaMalloc((void**)&model->aq_scratch, max_elems * sizeof(floatX)));
+        model->aq_scratch_elems = max_elems;
+    }
+    if (model->aq_group_maxes_scratch == nullptr || model->aq_group_maxes_scratch_elems < max_groups) {
+        cudaFreeCheck(&model->aq_group_maxes_scratch);
+        cudaCheck(cudaMalloc((void**)&model->aq_group_maxes_scratch, max_groups * sizeof(float)));
+        model->aq_group_maxes_scratch_elems = max_groups;
+    }
+    model->aq.initialized = true;
+
+    size_t aq_qvalue_bytes = 0;
+    size_t aq_scale_bytes = 0;
+    for (int i = 0; i < NUM_AQ_TENSORS; ++i) {
+        const QuantizedActivationTensor* qt = &model->aq.tensors[i];
+        size_t qbytes = (model->aq_type == AQ_TYPE_INT4) ? (qt->qvalue_count + 1) / 2 : qt->qvalue_count;
+        aq_qvalue_bytes += qbytes * sizeof(uint8_t);
+        aq_scale_bytes += qt->scale_count * sizeof(float);
+    }
+    const size_t aq_scratch_bytes = model->aq_scratch_elems * sizeof(floatX);
+    const size_t aq_group_scratch_bytes = model->aq_group_maxes_scratch_elems * sizeof(float);
+    const size_t aq_total_bytes = aq_qvalue_bytes + aq_scale_bytes + aq_scratch_bytes + aq_group_scratch_bytes;
+    printf0("AQ memory: qvalues=%zu MiB, scales=%zu MiB, scratch=%zu MiB, group_scratch=%zu MiB, total=%zu MiB\n",
+            aq_qvalue_bytes >> 20, aq_scale_bytes >> 20, aq_scratch_bytes >> 20,
+            aq_group_scratch_bytes >> 20, aq_total_bytes >> 20);
+}
+
+void aq_quantize_tensor_slice(GPT2* model, int aq_id, int layer_or_zero, const floatX* src, cudaStream_t stream) {
+    if (!model->aq_enabled || !model->aq.initialized) return;
+    QuantizedActivationTensor* qt = &model->aq.tensors[aq_id];
+    int layer_rows = (aq_id == AQ_TENSOR_FCH_GELU && model->recompute >= 1) ? (model->batch_size * model->seq_len)
+                                                                              : (model->batch_size * model->seq_len);
+    if (aq_id == AQ_TENSOR_LN1 || aq_id == AQ_TENSOR_LN2 || aq_id == AQ_TENSOR_FCH_GELU) {
+        if ((aq_id == AQ_TENSOR_LN1 || aq_id == AQ_TENSOR_LN2) && model->recompute >= 2) layer_rows = model->batch_size * model->seq_len;
+        if (aq_id == AQ_TENSOR_FCH_GELU && model->recompute >= 1) layer_rows = model->batch_size * model->seq_len;
+    }
+    size_t elem_offset = (size_t)layer_or_zero * layer_rows * qt->cols;
+    size_t scale_offset = (size_t)layer_or_zero * (layer_rows / qt->group_m) * qt->num_group_cols;
+    // INT4 packs two logical elements per byte, so the byte offset is half the element offset
+    size_t byte_offset = (model->aq_type == AQ_TYPE_INT4) ? elem_offset / 2 : elem_offset;
+    if (model->aq_type == AQ_TYPE_INT4) {
+        aq_quantize_int4_rows_gpu(qt->qvalues + byte_offset, qt->scales + scale_offset,
+                                  model->aq_group_maxes_scratch, src, layer_rows, qt->cols,
+                                  qt->group_m, qt->group_n, stream);
+    } else if (model->aq_type == AQ_TYPE_INT8) {
+        aq_quantize_int8_rows_gpu(qt->qvalues + byte_offset, qt->scales + scale_offset,
+                                  model->aq_group_maxes_scratch, src, layer_rows, qt->cols,
+                                  qt->group_m, qt->group_n, stream);
+    } else {
+        aq_quantize_fp8_rows_gpu(qt->qvalues + byte_offset, qt->scales + scale_offset,
+                                 model->aq_group_maxes_scratch, src, layer_rows, qt->cols,
+                                 qt->group_m, qt->group_n, stream);
+    }
+}
+
+void aq_dequantize_tensor_slice(GPT2* model, int aq_id, int layer_or_zero, floatX* dst, cudaStream_t stream) {
+    if (!model->aq_enabled || !model->aq.initialized) return;
+    QuantizedActivationTensor* qt = &model->aq.tensors[aq_id];
+    int layer_rows = model->batch_size * model->seq_len;
+    size_t elem_offset = (size_t)layer_or_zero * layer_rows * qt->cols;
+    size_t scale_offset = (size_t)layer_or_zero * (layer_rows / qt->group_m) * qt->num_group_cols;
+    size_t byte_offset = (model->aq_type == AQ_TYPE_INT4) ? elem_offset / 2 : elem_offset;
+    if (model->aq_type == AQ_TYPE_INT4) {
+        aq_dequantize_int4_rows_gpu(dst, qt->qvalues + byte_offset, qt->scales + scale_offset,
+                                    layer_rows, qt->cols, qt->group_m, qt->group_n, stream);
+    } else if (model->aq_type == AQ_TYPE_INT8) {
+        aq_dequantize_int8_rows_gpu(dst, qt->qvalues + byte_offset, qt->scales + scale_offset,
+                                    layer_rows, qt->cols, qt->group_m, qt->group_n, stream);
+    } else {
+        aq_dequantize_fp8_rows_gpu(dst, qt->qvalues + byte_offset, qt->scales + scale_offset,
+                                   layer_rows, qt->cols, qt->group_m, qt->group_n, stream);
+    }
+}
 
 void gpt2_clear_ptq(GPT2 *model) {
     for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
@@ -803,6 +1382,15 @@ void gpt2_clear_ptq(GPT2 *model) {
     model->ptq.quantized_weight_bytes = 0;
     model->ptq.num_quantized_tensors = 0;
     model->ptq.initialized = false;
+}
+
+void gpt2_clear_aq(GPT2 *model) {
+    for (int i = 0; i < NUM_AQ_TENSORS; ++i) {
+        cudaFreeCheck(&model->aq.tensors[i].qvalues);
+        cudaFreeCheck(&model->aq.tensors[i].scales);
+        model->aq.tensors[i] = {};
+    }
+    model->aq.initialized = false;
 }
 
 void gpt2_init_common(GPT2 *model) {
@@ -823,14 +1411,30 @@ void gpt2_init_common(GPT2 *model) {
     model->workload_indices = NULL; // on cpu, for encoder_backward
     model->bucket_info = NULL; // on cpu, for encoder_backward
     // memory lazily initialized in update()
-    model->m_memory = NULL;
-    model->v_memory = NULL;
+    model->optim_quant      = 0;
+    model->optim_group_size = COAT_GROUP_SIZE;
+    model->m_memory    = NULL;
+    model->v_memory    = NULL;
+    model->m_qstate    = nullptr;
+    model->v_qstate    = nullptr;
+    model->m_scales    = nullptr;
+    model->v_scales    = nullptr;
+    model->m_kfactors  = nullptr;
+    model->v_kfactors  = nullptr;
     model->master_weights = NULL;
     // beast-mode PTQ scratch (allocated in gpt2_prepare_ptq and gpt2_allocate_state)
     model->scratch_dequant = NULL;
     model->scratch_dequant_elems = 0;
     model->row_maxes_scratch = NULL;
     model->row_maxes_scratch_elems = 0;
+    model->aq_enabled = 0;
+    model->aq_type = AQ_TYPE_NONE;
+    model->aq_group_size = 32;
+    model->aq = {};
+    model->aq_scratch = NULL;
+    model->aq_scratch_elems = 0;
+    model->aq_group_maxes_scratch = NULL;
+    model->aq_group_maxes_scratch_elems = 0;
     // other default settings
     model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
     // In BF16 mode this is the important safeguard: update the FP32 master copy,
@@ -841,6 +1445,7 @@ void gpt2_init_common(GPT2 *model) {
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
     model->ptq_enabled = 0;
     model->ptq_precision = PTQ_PRECISION_NONE;
+    model->ptq_group_size = 0;
     model->ptq = {};
 }
 
@@ -867,20 +1472,23 @@ void gpt2_prepare_ptq(GPT2 *model) {
     }
 
     // ------------------------------------------------------------------ //
-    // Step 1: figure out scratch sizes needed across all quantized tensors
+    // Step 1: figure out scratch sizes needed across all quantized tensors.
+    // row_maxes_scratch stores per-(row, group) max-abs values, so its capacity
+    // must hold the largest per-tensor (total_rows * num_groups) we'll see.
     // ------------------------------------------------------------------ //
-    size_t max_rows = 0;
+    size_t max_group_maxes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
         if (!ptq_should_quantize_tensor(i)) continue;
         PTQTensorLayout layout = ptq_tensor_layout_for_index(model->config, i);
-        size_t total_rows = (size_t)layout.num_layers * layout.rows_per_layer;
-        if (total_rows > max_rows) max_rows = total_rows;
+        const int gs = ptq_resolve_group_size(model->ptq_group_size, layout.cols);
+        const size_t total_rows = (size_t)layout.num_layers * layout.rows_per_layer;
+        const size_t group_maxes = total_rows * (size_t)ptq_num_groups(layout.cols, gs);
+        if (group_maxes > max_group_maxes) max_group_maxes = group_maxes;
     }
-    // Allocate row_maxes_scratch if not already done
-    if (model->row_maxes_scratch == nullptr || model->row_maxes_scratch_elems < max_rows) {
+    if (model->row_maxes_scratch == nullptr || model->row_maxes_scratch_elems < max_group_maxes) {
         cudaFreeCheck(&model->row_maxes_scratch);
-        cudaCheck(cudaMalloc((void**)&model->row_maxes_scratch, max_rows * sizeof(float)));
-        model->row_maxes_scratch_elems = max_rows;
+        cudaCheck(cudaMalloc((void**)&model->row_maxes_scratch, max_group_maxes * sizeof(float)));
+        model->row_maxes_scratch_elems = max_group_maxes;
     }
 
     // ------------------------------------------------------------------ //
@@ -899,30 +1507,36 @@ void gpt2_prepare_ptq(GPT2 *model) {
         const size_t total_rows     = (size_t)layout.num_layers * layout.rows_per_layer;
         const size_t total_elements = total_rows * layout.cols;
         const size_t qbytes         = ptq_qvalue_bytes(total_elements, model->ptq_precision);
+        const int    group_size     = ptq_resolve_group_size(model->ptq_group_size, layout.cols);
+        const size_t scale_count    = total_rows * (size_t)ptq_num_groups(layout.cols, group_size);
         assert(total_elements == model->param_elements[i]);
 
         QuantizedTensor* qt = &model->ptq.tensors[i];
-        if (qt->initialized && qt->qvalue_bytes != qbytes) {
+        // Re-allocate buffers if shape (qbytes/scale_count) changed across runs.
+        if (qt->initialized && (qt->qvalue_bytes != qbytes || qt->scale_count != scale_count)) {
             cudaFreeCheck(&qt->qvalues);
             cudaFreeCheck(&qt->scales);
             qt->qvalue_bytes = 0;
+            qt->scale_count  = 0;
             qt->initialized = false;
         }
         if (!qt->initialized) {
             cudaCheck(cudaMalloc((void**)&qt->qvalues, qbytes));
-            cudaCheck(cudaMalloc((void**)&qt->scales,  total_rows     * sizeof(float)));
+            cudaCheck(cudaMalloc((void**)&qt->scales,  scale_count * sizeof(float)));
             qt->num_layers     = layout.num_layers;
             qt->rows_per_layer = layout.rows_per_layer;
             qt->cols           = layout.cols;
+            qt->group_size     = group_size;
             qt->qvalue_bytes   = qbytes;
+            qt->scale_count    = scale_count;
             qt->initialized    = true;
             model->ptq.num_quantized_tensors += 1;
         }
         model->ptq.original_weight_bytes += total_elements * sizeof(floatX);
-        model->ptq.quantized_weight_bytes += qbytes + total_rows * sizeof(float);
-        // GPU-quantize: floatX params -> uint8 qvalues + float scales
+        model->ptq.quantized_weight_bytes += qbytes + scale_count * sizeof(float);
+        // GPU-quantize: floatX params -> uint8 qvalues + float (group-wise) scales
         ptq_quantize_rows_gpu(qt->qvalues, qt->scales, model->row_maxes_scratch,
-                              *src_ptrs[i], (int)total_rows, layout.cols,
+                              *src_ptrs[i], (int)total_rows, layout.cols, group_size,
                               model->ptq_precision, main_stream);
     }
     cudaCheck(cudaStreamSynchronize(main_stream));
@@ -1005,9 +1619,11 @@ void gpt2_prepare_ptq(GPT2 *model) {
         double newmib, saved;
         if (ptq_should_quantize_tensor(i)) {
             PTQTensorLayout lo = ptq_tensor_layout_for_index(model->config, i);
-            size_t total_rows  = (size_t)lo.num_layers * lo.rows_per_layer;
+            const int gs = ptq_resolve_group_size(model->ptq_group_size, lo.cols);
+            const size_t total_rows = (size_t)lo.num_layers * lo.rows_per_layer;
+            const size_t scale_count = total_rows * (size_t)ptq_num_groups(lo.cols, gs);
             double qval_mib    = (double)ptq_qvalue_bytes(elems, model->ptq_precision) / (1024.0 * 1024.0);
-            double scale_mib   = (double)(total_rows * sizeof(float)) / (1024.0 * 1024.0);
+            double scale_mib   = (double)(scale_count * sizeof(float)) / (1024.0 * 1024.0);
             newmib = qval_mib + scale_mib;
             saved  = orig - newmib;
         } else {
@@ -1058,8 +1674,25 @@ void gpt2_print_ptq_summary(const GPT2 *model) {
     const double compression_ratio = quantized_bytes > 0 ? (double)original_bytes / (double)quantized_bytes : 0.0;
     const double savings_pct = original_bytes > 0 ? 100.0 * (1.0 - (double)quantized_bytes / (double)original_bytes) : 0.0;
 
+    // Build a human readable group size summary. Group size is per-tensor (resolved
+    // against each tensor's cols), so list "perRow" if every quantized tensor ended up
+    // with group_size == cols, otherwise list the requested value.
+    char group_size_desc[64];
+    bool all_per_row = true;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+        if (!ptq_should_quantize_tensor(i)) continue;
+        const QuantizedTensor* qt = &model->ptq.tensors[i];
+        if (qt->group_size != qt->cols) { all_per_row = false; break; }
+    }
+    if (model->ptq_group_size <= 0 || all_per_row) {
+        snprintf(group_size_desc, sizeof(group_size_desc), "perRow");
+    } else {
+        snprintf(group_size_desc, sizeof(group_size_desc), "%d", model->ptq_group_size);
+    }
+
     printf0("| ptq tensors list      | %-50s |\n", tensor_list);
     printf0("| ptq tensors           | %-50d |\n", model->ptq.num_quantized_tensors);
+    printf0("| ptq group_size        | %-50s |\n", group_size_desc);
     printf0("| ptq original bytes    | %-50zu |\n", original_bytes);
     printf0("| ptq quantized bytes   | %-50zu |\n", quantized_bytes);
     printf0("| ptq compression       | %-50.2fx |\n", compression_ratio);
@@ -1092,8 +1725,10 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     model->seq_len = T;
 
     // allocate the space
-    fill_in_activation_sizes(&model->acts, model->acts_specs, B, T, model->config, model->recompute);
-    model->acts_memory = malloc_and_point_activations(model->acts_specs);
+    fill_in_activation_sizes(&model->acts, model->acts_specs, B, T, model->config, model->recompute, model->aq_enabled != 0);
+    const size_t aq_extra_bytes = aq_estimate_activation_bytes(model);
+    model->acts_memory = malloc_and_point_activations(model->acts_specs, aq_extra_bytes);
+    gpt2_prepare_aq(model);
     // also create memory for caching inputs and targets
     cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
     cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
@@ -1114,12 +1749,36 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     // regardless of whether params/grads are stored as BF16 or FP32.
     // This is where most of the training-time "mixed precision" memory split is set up.
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters; // num parameters we are responsible for
-    printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
-    printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
-    assert(model->m_memory == nullptr);
-    assert(model->v_memory == nullptr);
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->m_memory, shard_num_parameters * sizeof(float));
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->v_memory, shard_num_parameters * sizeof(float));
+    if (model->optim_quant == 0) {
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+        assert(model->m_memory == nullptr);
+        assert(model->v_memory == nullptr);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_memory, shard_num_parameters * sizeof(float));
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_memory, shard_num_parameters * sizeof(float));
+    } else {
+        int    gs         = model->optim_group_size;
+        size_t num_groups = CEIL_DIV(shard_num_parameters, (size_t)gs);
+        // INT4: nibble-packed → 0.5 bytes/param; FP8/INT8: 1 byte/param.
+        size_t qstate_bytes = (model->optim_quant == 3)
+                              ? (shard_num_parameters + 1) / 2
+                              : shard_num_parameters * sizeof(uint8_t);
+        size_t meta_bytes   = num_groups * sizeof(float);
+        // All quantized modes now use COAT-style k-factors for dynamic range expansion.
+        const char* mode_name[] = {"", "FP8(COAT)", "INT8(COAT)", "INT4(COAT)"};
+        printf0("allocating %zu MiB for %s optimizer state m (qstate + scales + kfactors)\n",
+                (qstate_bytes + 2 * meta_bytes) >> 20, mode_name[model->optim_quant]);
+        printf0("allocating %zu MiB for %s optimizer state v (qstate + scales + kfactors)\n",
+                (qstate_bytes + 2 * meta_bytes) >> 20, mode_name[model->optim_quant]);
+        assert(model->m_qstate == nullptr && model->v_qstate == nullptr);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_qstate,    qstate_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_qstate,    qstate_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_scales,    meta_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_scales,    meta_bytes);
+        // All modes need k-factors (INT8 and INT4 use COAT expansion like FP8).
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->m_kfactors,  meta_bytes);
+        memory_status |= cudaMallocConditionallyManaged((void**)&model->v_kfactors,  meta_bytes);
+    }
 
     if (model->use_master_weights == 1) {
         assert(model->master_weights == nullptr);
@@ -1176,6 +1835,9 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
         }
         model_header[1] = base + precision_offset;
         model_header[8] = (int)model->ptq_precision; // store precision enum in header
+        // Group size for grouped quantization. 0 means per-row (legacy). Stored as the
+        // requested value (so reload knows what to resolve against per-tensor cols).
+        model_header[9] = model->ptq_group_size;
     }
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
@@ -1201,9 +1863,8 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
                 device_to_file(model_file, *(ptrs[i]), bytes, IO_BUF_SIZE, main_stream);
             } else {
                 const QuantizedTensor* qt = &model->ptq.tensors[i];
-                size_t total_rows = (size_t)qt->num_layers * qt->rows_per_layer;
-                size_t qbytes     = qt->qvalue_bytes;
-                size_t sbytes     = total_rows * sizeof(float);
+                size_t qbytes = qt->qvalue_bytes;
+                size_t sbytes = qt->scale_count * sizeof(float);
                 device_to_file(model_file, qt->qvalues, qbytes, IO_BUF_SIZE, main_stream);
                 device_to_file(model_file, qt->scales,  sbytes, IO_BUF_SIZE, main_stream);
             }
@@ -1276,6 +1937,10 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
                 exit(EXIT_FAILURE);
             }
             model->ptq_precision = ckpt_prec;
+            // Group size: 0 in legacy headers (zeroed memset above) means per-row, which
+            // resolves per-tensor to group_size = cols. Stored requested value otherwise.
+            const int ckpt_group_size = model_header[9];
+            model->ptq_group_size = ckpt_group_size;
             model->ptq.original_weight_bytes = 0;
             model->ptq.quantized_weight_bytes = 0;
             model->ptq.num_quantized_tensors = 0;
@@ -1290,21 +1955,25 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
                     size_t bytes = model->param_elements[i] * sizeof(floatX);
                     file_to_device(*(ptrs[i]), model_file, bytes, IO_BUF_SIZE, main_stream);
                 } else {
+                    const int    group_size  = ptq_resolve_group_size(ckpt_group_size, layout.cols);
+                    const size_t scale_count = total_rows * (size_t)ptq_num_groups(layout.cols, group_size);
                     QuantizedTensor* qt = &model->ptq.tensors[i];
                     if (!qt->initialized) {
                         cudaCheck(cudaMalloc((void**)&qt->qvalues, qbytes));
-                        cudaCheck(cudaMalloc((void**)&qt->scales,  total_rows     * sizeof(float)));
+                        cudaCheck(cudaMalloc((void**)&qt->scales,  scale_count * sizeof(float)));
                         qt->num_layers     = layout.num_layers;
                         qt->rows_per_layer = layout.rows_per_layer;
                         qt->cols           = layout.cols;
+                        qt->group_size     = group_size;
                         qt->qvalue_bytes   = qbytes;
+                        qt->scale_count    = scale_count;
                         qt->initialized    = true;
                     }
                     model->ptq.original_weight_bytes += total_elements * sizeof(floatX);
-                    model->ptq.quantized_weight_bytes += qbytes + total_rows * sizeof(float);
+                    model->ptq.quantized_weight_bytes += qbytes + scale_count * sizeof(float);
                     model->ptq.num_quantized_tensors += 1;
                     file_to_device(qt->qvalues, model_file, qbytes, IO_BUF_SIZE, main_stream);
-                    file_to_device(qt->scales,  model_file, total_rows     * sizeof(float),
+                    file_to_device(qt->scales,  model_file, scale_count * sizeof(float),
                                    IO_BUF_SIZE, main_stream);
                 }
             }
@@ -1523,7 +2192,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
 
     // first layernorm isn't fused
+    bool aq = model->aq_enabled && model->aq.initialized;
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
+    if (aq && model->recompute < 2) {
+        aq_quantize_tensor_slice(model, AQ_TENSOR_LN1, 0, acts.ln1, main_stream);
+    }
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
@@ -1555,13 +2228,24 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
+        floatX* l_ln2_store = (model->recompute < 2)
+                            ? (aq ? model->aq_scratch : acts.ln2 + l * B * T * C)
+                            : acts.lnf;
+        floatX* l_ln2 = l_ln2_store;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu_store = (model->recompute < 1)
+                                 ? (aq ? acts.scratch_bt4c : acts.fch_gelu + l * B * T * 4*C)
+                                 : acts.fch_gelu;
+        floatX* l_fch_gelu = l_fch_gelu_store;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
+
+        if (aq && model->recompute < 2) {
+            aq_dequantize_tensor_slice(model, AQ_TENSOR_LN1, l, model->aq_scratch, main_stream);
+            l_ln1 = model->aq_scratch;
+        }
 
         // ---------- QKV matmul ----------
         if (beast) {
@@ -1580,6 +2264,9 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
+        if (aq) {
+            aq_quantize_tensor_slice(model, AQ_TENSOR_QKVR, l, l_qkvr, main_stream);
+        }
 
         // ---------- attention projection ----------
         if (beast) {
@@ -1587,14 +2274,31 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             l_attprojw = sd;
         }
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
+        if (aq) {
+            aq_quantize_tensor_slice(model, AQ_TENSOR_ATTY, l, l_atty, main_stream);
+        }
+        fused_residual_forward5(l_residual2, l_ln2_store, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
+        if (aq) {
+            if (model->recompute < 2) {
+                aq_quantize_tensor_slice(model, AQ_TENSOR_LN2, l, l_ln2_store, main_stream);
+            }
+            aq_quantize_tensor_slice(model, AQ_TENSOR_RESIDUAL2, l, l_residual2, main_stream);
+        }
 
         // ---------- MLP up-projection (fc) ----------
         if (beast) {
             ptq_dequantize_layer_slice(sd, &model->ptq.tensors[10], l, model->ptq_precision, main_stream);
             l_fcw = sd;
         }
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+        matmul_forward_cublaslt(l_fch_gelu_store, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+        if (aq) {
+            aq_quantize_tensor_slice(model, AQ_TENSOR_FCH, l, l_fch, main_stream);
+            if (model->recompute < 1) {
+                aq_quantize_tensor_slice(model, AQ_TENSOR_FCH_GELU, l, l_fch_gelu_store, main_stream);
+                aq_dequantize_tensor_slice(model, AQ_TENSOR_FCH_GELU, l, model->aq_scratch, main_stream);
+                l_fch_gelu = model->aq_scratch;
+            }
+        }
 
         // ---------- MLP down-projection (fcproj) ----------
         if (beast) {
@@ -1612,6 +2316,9 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
                                     B * T, C, main_stream);
+            if (aq && model->recompute < 2) {
+                aq_quantize_tensor_slice(model, AQ_TENSOR_LN1, l + 1, l_ln1, main_stream);
+            }
         } else {
             fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
                                     params.lnfw, params.lnfb,
@@ -1725,6 +2432,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         bool beast = model->ptq_enabled && model->ptq.initialized;
+        bool aq = model->aq_enabled && model->aq.initialized;
         floatX* sd = model->scratch_dequant;
 
         // -- non-quantized weight pointers (always valid) --
@@ -1760,11 +2468,18 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
+        floatX* l_ln2 = (model->recompute < 2) ? (aq ? nullptr : acts.ln2 + l * B * T * C) : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch_pre_gelu = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu = (model->recompute < 1) ? (aq ? nullptr : acts.fch_gelu + l * B * T * 4*C) : acts.fch_gelu;
+
+        if (aq) {
+            aq_dequantize_tensor_slice(model, AQ_TENSOR_FCH, l, l_fch_pre_gelu, main_stream);
+            aq_dequantize_tensor_slice(model, AQ_TENSOR_RESIDUAL2, l, l_residual2, main_stream);
+            aq_dequantize_tensor_slice(model, AQ_TENSOR_ATTY, l, l_atty, main_stream);
+            aq_dequantize_tensor_slice(model, AQ_TENSOR_QKVR, l, l_qkvr, main_stream);
+        }
 
         floatX* dl_bt4c = (floatX*)model->acts.scratch_bt4c;
 
@@ -1778,6 +2493,10 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             ptq_dequantize_layer_slice(sd, &model->ptq.tensors[12], l, model->ptq_precision, main_stream);
             l_fcprojw = sd;
         }
+        if (aq && model->recompute < 1) {
+            aq_dequantize_tensor_slice(model, AQ_TENSOR_FCH_GELU, l, model->aq_scratch, main_stream);
+            l_fch_gelu = model->aq_scratch;
+        }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
 
         if(model->recompute >= 2) {
@@ -1788,6 +2507,10 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         if (beast) {
             ptq_dequantize_layer_slice(sd, &model->ptq.tensors[10], l, model->ptq_precision, main_stream);
             l_fcw = sd;
+        }
+        if (aq && model->recompute < 2) {
+            aq_dequantize_tensor_slice(model, AQ_TENSOR_LN2, l, model->aq_scratch, main_stream);
+            l_ln2 = model->aq_scratch;
         }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
@@ -1937,7 +2660,10 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // selectively weight decay some, but not all tensors :(
     // TODO: revisit and probably refactor this entire function
     NVTX_RANGE_FN();
-    if(model->grads_memory == nullptr || model->m_memory == nullptr || model->v_memory == nullptr) {
+    bool quant_optim = model->optim_quant > 0;
+    if(model->grads_memory == nullptr ||
+       (!quant_optim && (model->m_memory == nullptr || model->v_memory == nullptr)) ||
+       ( quant_optim && (model->m_qstate == nullptr || model->v_qstate == nullptr))) {
         fprintf(stderr, "Need to allocate optimizer state before update");
         exit(EXIT_FAILURE);
     }
@@ -1946,8 +2672,22 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     if(init_state) {
         model->init_state = false;
         NvtxRange rng("InitOpt");
-        cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
+        size_t np = multi_gpu_config->shard_num_parameters;
+        if (!quant_optim) {
+            cudaCheck(cudaMemset(model->m_memory, 0, np * sizeof(float)));
+            cudaCheck(cudaMemset(model->v_memory, 0, np * sizeof(float)));
+        } else {
+            int    gs         = model->optim_group_size;
+            size_t num_groups = CEIL_DIV(np, (size_t)gs);
+            size_t qstate_bytes = (model->optim_quant == 3) ? (np + 1) / 2 : np * sizeof(uint8_t);
+            cudaCheck(cudaMemset(model->m_qstate, 0, qstate_bytes));
+            cudaCheck(cudaMemset(model->v_qstate, 0, qstate_bytes));
+            cudaCheck(cudaMemset(model->m_scales,   0, num_groups * sizeof(float)));
+            cudaCheck(cudaMemset(model->v_scales,   0, num_groups * sizeof(float)));
+            // All quantized modes use COAT k-factors now.
+            cudaCheck(cudaMemset(model->m_kfactors, 0, num_groups * sizeof(float)));
+            cudaCheck(cudaMemset(model->v_kfactors, 0, num_groups * sizeof(float)));
+        }
     }
 
     // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
@@ -1985,8 +2725,10 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
         ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ? local_offset_full : local_offset_partial;
-        float* m_ptr      = model->m_memory      + opt_state_offset;
-        float* v_ptr      = model->v_memory      + opt_state_offset;
+        float* m_ptr = quant_optim ? nullptr : model->m_memory + opt_state_offset;
+        float* v_ptr = quant_optim ? nullptr : model->v_memory + opt_state_offset;
+        int    oq    = model->optim_quant;
+        int    ogs   = model->optim_group_size;
         float* master_ptr = nullptr;
         if (model->master_weights != nullptr) { master_ptr = model->master_weights + opt_state_offset; }
 
@@ -2005,11 +2747,41 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
             }
             if (init_from_master_only) {
                 init_from_master(param_ptr, master_ptr, shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
-            } else {
+            } else if (oq == 0) {
                 adamw_update(param_ptr, master_ptr, grad_ptr,
                              m_ptr, v_ptr,
                              shard.size, tensor.size, tensor.size, shard.size, num_layers,
                              learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+            } else if (oq == 1) {
+                adamw_update_coat(param_ptr, master_ptr, grad_ptr,
+                                  model->m_qstate   + opt_state_offset,
+                                  model->v_qstate   + opt_state_offset,
+                                  model->m_scales   + opt_state_offset / ogs,
+                                  model->v_scales   + opt_state_offset / ogs,
+                                  model->m_kfactors + opt_state_offset / ogs,
+                                  model->v_kfactors + opt_state_offset / ogs,
+                                  shard.size, tensor.size, tensor.size, shard.size, num_layers, ogs,
+                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+            } else if (oq == 2) {
+                adamw_update_int8(param_ptr, master_ptr, grad_ptr,
+                                  model->m_qstate   + opt_state_offset,
+                                  model->v_qstate   + opt_state_offset,
+                                  model->m_scales   + opt_state_offset / ogs,
+                                  model->v_scales   + opt_state_offset / ogs,
+                                  model->m_kfactors + opt_state_offset / ogs,
+                                  model->v_kfactors + opt_state_offset / ogs,
+                                  shard.size, tensor.size, tensor.size, shard.size, num_layers, ogs,
+                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+            } else { // INT4
+                adamw_update_int4(param_ptr, master_ptr, grad_ptr,
+                                  model->m_qstate   + opt_state_offset / 2,
+                                  model->v_qstate   + opt_state_offset / 2,
+                                  model->m_scales   + opt_state_offset / ogs,
+                                  model->v_scales   + opt_state_offset / ogs,
+                                  model->m_kfactors + opt_state_offset / ogs,
+                                  model->v_kfactors + opt_state_offset / ogs,
+                                  shard.size, tensor.size, tensor.size, shard.size, num_layers, ogs,
+                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
             }
         } else {
             // ----------------------------------------------------------------
@@ -2041,38 +2813,77 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                 if (!init_from_master_only) {
                     // AdamW: sd is the param (for weight decay reads); master_ptr gets the FP32 update;
                     // sd also receives the stochastic-rounded floatX output (we discard it below).
-                    adamw_update(sd, layer_master_ptr, layer_grad_ptr,
-                                 m_ptr + l * (ptrdiff_t)layer_elems,
-                                 v_ptr + l * (ptrdiff_t)layer_elems,
-                                 layer_elems, layer_elems, layer_elems, layer_elems, 1,
-                                 learning_rate, beta1, beta2, t, eps, wd, grad_scale,
-                                 seed + (unsigned int)l, main_stream);
+                    ptrdiff_t layer_param_offset = opt_state_offset + l * (ptrdiff_t)layer_elems;
+                    ptrdiff_t layer_meta_offset  = layer_param_offset / ogs;
+                    if (oq == 0) {
+                        adamw_update(sd, layer_master_ptr, layer_grad_ptr,
+                                     m_ptr + l * (ptrdiff_t)layer_elems,
+                                     v_ptr + l * (ptrdiff_t)layer_elems,
+                                     layer_elems, layer_elems, layer_elems, layer_elems, 1,
+                                     learning_rate, beta1, beta2, t, eps, wd, grad_scale,
+                                     seed + (unsigned int)l, main_stream);
+                    } else if (oq == 1) {
+                        adamw_update_coat(sd, layer_master_ptr, layer_grad_ptr,
+                                          model->m_qstate   + layer_param_offset,
+                                          model->v_qstate   + layer_param_offset,
+                                          model->m_scales   + layer_meta_offset,
+                                          model->v_scales   + layer_meta_offset,
+                                          model->m_kfactors + layer_meta_offset,
+                                          model->v_kfactors + layer_meta_offset,
+                                          layer_elems, layer_elems, layer_elems, layer_elems, 1, ogs,
+                                          learning_rate, beta1, beta2, t, eps, wd, grad_scale,
+                                          seed + (unsigned int)l, main_stream);
+                    } else if (oq == 2) {
+                        adamw_update_int8(sd, layer_master_ptr, layer_grad_ptr,
+                                          model->m_qstate   + layer_param_offset,
+                                          model->v_qstate   + layer_param_offset,
+                                          model->m_scales   + layer_meta_offset,
+                                          model->v_scales   + layer_meta_offset,
+                                          model->m_kfactors + layer_meta_offset,
+                                          model->v_kfactors + layer_meta_offset,
+                                          layer_elems, layer_elems, layer_elems, layer_elems, 1, ogs,
+                                          learning_rate, beta1, beta2, t, eps, wd, grad_scale,
+                                          seed + (unsigned int)l, main_stream);
+                    } else { // INT4
+                        adamw_update_int4(sd, layer_master_ptr, layer_grad_ptr,
+                                          model->m_qstate   + layer_param_offset / 2,
+                                          model->v_qstate   + layer_param_offset / 2,
+                                          model->m_scales   + layer_meta_offset,
+                                          model->v_scales   + layer_meta_offset,
+                                          model->m_kfactors + layer_meta_offset,
+                                          model->v_kfactors + layer_meta_offset,
+                                          layer_elems, layer_elems, layer_elems, layer_elems, 1, ogs,
+                                          learning_rate, beta1, beta2, t, eps, wd, grad_scale,
+                                          seed + (unsigned int)l, main_stream);
+                    }
                     // Re-quantize from master_weights (FP32) → qvalues/scales.
                     // This is more accurate than quantizing from the stochastic-rounded floatX in sd.
                     const float* src = layer_master_ptr ? layer_master_ptr : nullptr;
                     if (src != nullptr) {
-                        size_t scale_offset = (size_t)l * qt->rows_per_layer;
+                        const int num_groups_t = ptq_num_groups(qt->cols, qt->group_size);
+                        size_t scale_offset = (size_t)l * qt->rows_per_layer * num_groups_t;
                         size_t elem_offset  = (size_t)l * qt->rows_per_layer * qt->cols;
                         size_t byte_offset  = ptq_qvalue_bytes(elem_offset, model->ptq_precision);
                         ptq_quantize_rows_gpu_fp32(
                             qt->qvalues + byte_offset,
                             qt->scales  + scale_offset,
                             model->row_maxes_scratch,
-                            src, qt->rows_per_layer, qt->cols,
+                            src, qt->rows_per_layer, qt->cols, qt->group_size,
                             model->ptq_precision, main_stream);
                     }
                 } else {
                     // Checkpoint-resume: restore floatX param from master (for non-beast we'd use init_from_master)
                     // For beast: dequantize the master back into qvalues/scales
                     if (master_ptr != nullptr) {
-                        size_t scale_offset = (size_t)l * qt->rows_per_layer;
+                        const int num_groups_t = ptq_num_groups(qt->cols, qt->group_size);
+                        size_t scale_offset = (size_t)l * qt->rows_per_layer * num_groups_t;
                         size_t elem_offset  = (size_t)l * qt->rows_per_layer * qt->cols;
                         size_t byte_offset  = ptq_qvalue_bytes(elem_offset, model->ptq_precision);
                         ptq_quantize_rows_gpu_fp32(
                             qt->qvalues + byte_offset,
                             qt->scales  + scale_offset,
                             model->row_maxes_scratch,
-                            layer_master_ptr, qt->rows_per_layer, qt->cols,
+                            layer_master_ptr, qt->rows_per_layer, qt->cols, qt->group_size,
                             model->ptq_precision, main_stream);
                     }
                 }
@@ -2131,12 +2942,21 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 
 void gpt2_free(GPT2 *model) {
     gpt2_clear_ptq(model);
+    gpt2_clear_aq(model);
     cudaFreeCheck(&model->scratch_dequant);
     cudaFreeCheck(&model->row_maxes_scratch);
+    cudaFreeCheck(&model->aq_scratch);
+    cudaFreeCheck(&model->aq_group_maxes_scratch);
     cudaFreeCheck(&model->params_memory);
     cudaFreeCheck(&model->grads_memory);
     cudaFreeCheck(&model->m_memory);
     cudaFreeCheck(&model->v_memory);
+    cudaFreeCheck(&model->m_qstate);
+    cudaFreeCheck(&model->v_qstate);
+    cudaFreeCheck(&model->m_scales);
+    cudaFreeCheck(&model->v_scales);
+    cudaFreeCheck(&model->m_kfactors);
+    cudaFreeCheck(&model->v_kfactors);
     cudaFreeCheck(&model->master_weights);
     cudaFreeCheck(&model->acts_memory);
     cudaFreeCheck(&model->inputs);
@@ -2209,10 +3029,25 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
     fwriteCheck(state_header, sizeof(int), 256, state_file);
 
-    // write AdamW m, v, and master_weights here (they are all float)
+    // write AdamW optimizer state and master_weights
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
-    device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    if (model->optim_quant == 0) {
+        device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    } else {
+        int    gs         = model->optim_group_size;
+        size_t num_groups = CEIL_DIV(shard_num_parameters, (size_t)gs);
+        size_t qstate_bytes = (model->optim_quant == 3)
+                              ? (shard_num_parameters + 1) / 2
+                              : shard_num_parameters * sizeof(uint8_t);
+        device_to_file(state_file, model->m_qstate, qstate_bytes, IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_qstate, qstate_bytes, IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->m_scales,   num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_scales,   num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        // All quantized modes save k-factors (all use COAT-style expansion now).
+        device_to_file(state_file, model->m_kfactors, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        device_to_file(state_file, model->v_kfactors, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+    }
     if(model->use_master_weights) {
         device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     }
@@ -2244,8 +3079,7 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
     size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
 
-    // read AdamW m, v, master_weights (they are all float)
-    // allocate all the needed memory as necessary
+    // read AdamW optimizer state and master_weights
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
     if(use_master_weights == 1 && !model->use_master_weights) {
         printf0("Warning: Master weights are present in state, but not enabled for current run.");
@@ -2255,10 +3089,25 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     }
 
     model->init_state = false;      // we just got the state from file, no need to do first-touch init
-    assert(model->m_memory != nullptr);
-    assert(model->v_memory != nullptr);
-    file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    if (model->optim_quant == 0) {
+        assert(model->m_memory != nullptr && model->v_memory != nullptr);
+        file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    } else {
+        int    gs         = model->optim_group_size;
+        size_t num_groups = CEIL_DIV(shard_num_parameters, (size_t)gs);
+        size_t qstate_bytes = (model->optim_quant == 3)
+                              ? (shard_num_parameters + 1) / 2
+                              : shard_num_parameters * sizeof(uint8_t);
+        assert(model->m_qstate != nullptr && model->v_qstate != nullptr);
+        file_to_device(model->m_qstate, state_file, qstate_bytes, IO_BUF_SIZE, main_stream);
+        file_to_device(model->v_qstate, state_file, qstate_bytes, IO_BUF_SIZE, main_stream);
+        file_to_device(model->m_scales,   state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        file_to_device(model->v_scales,   state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        // All quantized modes load k-factors.
+        file_to_device(model->m_kfactors, state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+        file_to_device(model->v_kfactors, state_file, num_groups * sizeof(float), IO_BUF_SIZE, main_stream);
+    }
     if(model->use_master_weights) {
         assert(model->master_weights != nullptr);
         file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
@@ -2388,6 +3237,13 @@ void error_usage() {
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
     fprintf(stderr, "  --ptq <0|1>           enable row-wise PTQ for large weight tensors (default = 0)\n");
     fprintf(stderr, "  --ptq_precision <str> PTQ precision for quantized weights: int8|fp8|int4 (default = int8)\n");
+    fprintf(stderr, "  --ptq_group_size <int> group size along cols for group-wise int4 quantization\n");
+    fprintf(stderr, "                         (default = 128 when precision=int4, 0 = per-row otherwise)\n");
+    fprintf(stderr, "  --aq <0|1>            enable activation quantization (default = 0)\n");
+    fprintf(stderr, "  --aq_type <str>       activation quantization type: fp8|int8|int4 (default = fp8)\n");
+    fprintf(stderr, "  --aq_group_size <int> group size for activation quantization (default = 32)\n");
+    fprintf(stderr, "  --optim_quant <str>   optimizer state format: fp32|fp8|int8|int4 (default = fp32)\n");
+    fprintf(stderr, "  --optim_group_size <int> group size for quantized moments (default = %d)\n", COAT_GROUP_SIZE);
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
     fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
@@ -2435,6 +3291,12 @@ int main(int argc, char *argv[]) {
     int hellaswag_eval = 0;
     int ptq_enabled = 0;
     const char* ptq_precision_name = "int8";
+    int ptq_group_size = -1; // -1 = unset; resolved after we know the precision
+    const char* optim_quant_name = "fp32";
+    int optim_group_size = COAT_GROUP_SIZE;
+    int aq_enabled = 0;
+    const char* aq_type_name = "fp8";
+    int aq_group_size = 32;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -2446,6 +3308,12 @@ int main(int argc, char *argv[]) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (strcmp(argv[i], "--ptq") == 0) { ptq_enabled = atoi(argv[i+1]); continue; }
         if (strcmp(argv[i], "--ptq_precision") == 0) { ptq_precision_name = argv[i+1]; continue; }
+        if (strcmp(argv[i], "--ptq_group_size") == 0) { ptq_group_size = atoi(argv[i+1]); continue; }
+        if (strcmp(argv[i], "--aq") == 0) { aq_enabled = atoi(argv[i+1]); continue; }
+        if (strcmp(argv[i], "--aq_type") == 0) { aq_type_name = argv[i+1]; continue; }
+        if (strcmp(argv[i], "--aq_group_size") == 0) { aq_group_size = atoi(argv[i+1]); continue; }
+        if (strcmp(argv[i], "--optim_quant") == 0) { optim_quant_name = argv[i+1]; continue; }
+        if (strcmp(argv[i], "--optim_group_size") == 0) { optim_group_size = atoi(argv[i+1]); continue; }
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
         // read in the args
@@ -2508,6 +3376,13 @@ int main(int argc, char *argv[]) {
     // if we're only overfitting a single batch for debugging, let's overfit the first batch
     // from val instead of train split, because val is smaller and faster. (train_gpt2.py does the same)
     if (overfit_single_batch == 1) { train_data_pattern = val_data_pattern; }
+    // Resolve default ptq_group_size before printing so the banner shows the effective value.
+    // 128 for int4 (group-wise is the practical default), 0 (per-row) otherwise.
+    if (ptq_group_size < 0) {
+        const PTQPrecision pp = ptq_enabled ? ptq_precision_from_string(ptq_precision_name)
+                                            : PTQ_PRECISION_NONE;
+        ptq_group_size = (pp == PTQ_PRECISION_INT4) ? 128 : 0;
+    }
     printf0("+-----------------------+----------------------------------------------------+\n");
     printf0("| Parameter             | Value                                              |\n");
     printf0("+-----------------------+----------------------------------------------------+\n");
@@ -2537,6 +3412,12 @@ int main(int argc, char *argv[]) {
     printf0("| recompute             | %-50d |\n", recompute);
     printf0("| ptq enabled           | %-50s |\n", ptq_enabled ? "yes" : "no");
     printf0("| ptq precision         | %-50s |\n", ptq_enabled ? ptq_precision_name : "n/a");
+    printf0("| ptq group_size (req)  | %-50d |\n", ptq_enabled ? ptq_group_size : 0);
+    printf0("| aq enabled            | %-50s |\n", aq_enabled ? "yes" : "no");
+    printf0("| aq type               | %-50s |\n", aq_enabled ? aq_type_name : "n/a");
+    printf0("| aq group_size         | %-50d |\n", aq_enabled ? aq_group_size : 0);
+    printf0("| optim_quant           | %-50s |\n", optim_quant_name);
+    printf0("| optim_group_size      | %-50d |\n", optim_group_size);
     printf0("+-----------------------+----------------------------------------------------+\n");
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
@@ -2579,7 +3460,54 @@ int main(int argc, char *argv[]) {
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
     model.ptq_enabled = ptq_enabled;
+    // Parse optim_quant name → integer
+    {
+        int oq = 0;
+        if      (strcmp(optim_quant_name, "fp32") == 0) oq = 0;
+        else if (strcmp(optim_quant_name, "fp8")  == 0) oq = 1;
+        else if (strcmp(optim_quant_name, "int8") == 0) oq = 2;
+        else if (strcmp(optim_quant_name, "int4") == 0) oq = 3;
+        else {
+            fprintf(stderr, "Unknown --optim_quant '%s'. Expected fp32|fp8|int8|int4.\n", optim_quant_name);
+            exit(EXIT_FAILURE);
+        }
+        if (oq > 0) {
+            bool is_pow2 = (optim_group_size > 0) && ((optim_group_size & (optim_group_size - 1)) == 0);
+            if (!is_pow2 || optim_group_size < 4 || optim_group_size > 1024) {
+                fprintf(stderr, "--optim_group_size must be a power of 2 in [4, 1024] (got %d)\n", optim_group_size);
+                exit(EXIT_FAILURE);
+            }
+        }
+        if (oq == 3 && optim_group_size % 2 != 0) {
+            fprintf(stderr, "--optim_group_size must be even for int4 (got %d)\n", optim_group_size);
+            exit(EXIT_FAILURE);
+        }
+        model.optim_quant      = oq;
+        model.optim_group_size = optim_group_size;
+    }
+    // Parse aq_type name → AQType
+    {
+        AQType at = AQ_TYPE_NONE;
+        if (aq_enabled) {
+            if      (strcmp(aq_type_name, "fp8")  == 0) at = AQ_TYPE_FP8;
+            else if (strcmp(aq_type_name, "int8") == 0) at = AQ_TYPE_INT8;
+            else if (strcmp(aq_type_name, "int4") == 0) at = AQ_TYPE_INT4;
+            else {
+                fprintf(stderr, "Unknown --aq_type '%s'. Expected fp8|int8|int4.\n", aq_type_name);
+                exit(EXIT_FAILURE);
+            }
+            if (aq_group_size <= 0) {
+                fprintf(stderr, "--aq_group_size must be positive (got %d)\n", aq_group_size);
+                exit(EXIT_FAILURE);
+            }
+        }
+        model.aq_enabled   = aq_enabled;
+        model.aq_type      = at;
+        model.aq_group_size = aq_group_size;
+    }
     model.ptq_precision = ptq_enabled ? ptq_precision_from_string(ptq_precision_name) : PTQ_PRECISION_NONE;
+    // ptq_group_size has already been resolved above (default 128 for int4, 0 per-row otherwise).
+    model.ptq_group_size = ptq_group_size;
     if (!(resuming == 1 && use_master_weights == 1)) {
         gpt2_prepare_ptq(&model);
     }
