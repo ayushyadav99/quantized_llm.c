@@ -54,6 +54,15 @@ def extract_label(cmd):
     if ce and ce.group(1) == "0":
         parts.append("no-expansion")
 
+    aq = re.search(r'--aq\s+1', cmd)
+    if aq:
+        aq_type = re.search(r'--aq_type\s+(\S+)', cmd)
+        aq_gs   = re.search(r'--aq_group_size\s+(\S+)', cmd)
+        aq_str  = f"aq-{aq_type.group(1) if aq_type else 'fp8'}"
+        if aq_gs:
+            aq_str += f"-gs={aq_gs.group(1)}"
+        parts.append(aq_str)
+
     if re.search(r'-w\s+0', cmd):
         parts.append("no-master")
 
