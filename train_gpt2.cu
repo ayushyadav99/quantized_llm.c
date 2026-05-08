@@ -2870,6 +2870,19 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                             model->row_maxes_scratch,
                             src, qt->rows_per_layer, qt->cols, qt->group_size,
                             model->ptq_precision, main_stream);
+                    } else {
+                        // No master weights: adamw wrote the updated params into sd (floatX).
+                        // Re-quantize directly from sd using the floatX source path.
+                        const int num_groups_t = ptq_num_groups(qt->cols, qt->group_size);
+                        size_t scale_offset = (size_t)l * qt->rows_per_layer * num_groups_t;
+                        size_t elem_offset  = (size_t)l * qt->rows_per_layer * qt->cols;
+                        size_t byte_offset  = ptq_qvalue_bytes(elem_offset, model->ptq_precision);
+                        ptq_quantize_rows_gpu(
+                            qt->qvalues + byte_offset,
+                            qt->scales  + scale_offset,
+                            model->row_maxes_scratch,
+                            sd, qt->rows_per_layer, qt->cols, qt->group_size,
+                            model->ptq_precision, main_stream);
                     }
                 } else {
                     // Checkpoint-resume: restore floatX param from master (for non-beast we'd use init_from_master)
@@ -3284,7 +3297,7 @@ int main(int argc, char *argv[]) {
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     int max_steps = -1;
     int override_enable_tf32 = 1;
-    int use_master_weights = 1;
+    int use_master_weights = 0;
     int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
