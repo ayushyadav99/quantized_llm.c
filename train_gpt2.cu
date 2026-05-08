@@ -1119,6 +1119,7 @@ struct GPT2 {
     // optim_quant: 0=fp32, 1=fp8(COAT), 2=int8, 3=int4
     int optim_quant;
     int optim_group_size; // group size for quantized moments (all modes)
+    int coat_expansion;   // 1=use COAT k-factor dynamic range expansion, 0=plain absmax
     float* m_memory;      // FP32 moments (optim_quant==0 only)
     float* v_memory;
     // Quantized moment storage (optim_quant 1/2/3). Reused across formats:
@@ -1413,6 +1414,7 @@ void gpt2_init_common(GPT2 *model) {
     // memory lazily initialized in update()
     model->optim_quant      = 0;
     model->optim_group_size = COAT_GROUP_SIZE;
+    model->coat_expansion   = 1;
     model->m_memory    = NULL;
     model->v_memory    = NULL;
     model->m_qstate    = nullptr;
@@ -2661,6 +2663,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     // TODO: revisit and probably refactor this entire function
     NVTX_RANGE_FN();
     bool quant_optim = model->optim_quant > 0;
+    bool coat_exp    = (bool)model->coat_expansion;
     if(model->grads_memory == nullptr ||
        (!quant_optim && (model->m_memory == nullptr || model->v_memory == nullptr)) ||
        ( quant_optim && (model->m_qstate == nullptr || model->v_qstate == nullptr))) {
@@ -2761,7 +2764,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                   model->m_kfactors + opt_state_offset / ogs,
                                   model->v_kfactors + opt_state_offset / ogs,
                                   shard.size, tensor.size, tensor.size, shard.size, num_layers, ogs,
-                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, coat_exp, main_stream);
             } else if (oq == 2) {
                 adamw_update_int8(param_ptr, master_ptr, grad_ptr,
                                   model->m_qstate   + opt_state_offset,
@@ -2771,7 +2774,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                   model->m_kfactors + opt_state_offset / ogs,
                                   model->v_kfactors + opt_state_offset / ogs,
                                   shard.size, tensor.size, tensor.size, shard.size, num_layers, ogs,
-                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, coat_exp, main_stream);
             } else { // INT4
                 adamw_update_int4(param_ptr, master_ptr, grad_ptr,
                                   model->m_qstate   + opt_state_offset / 2,
@@ -2781,7 +2784,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                   model->m_kfactors + opt_state_offset / ogs,
                                   model->v_kfactors + opt_state_offset / ogs,
                                   shard.size, tensor.size, tensor.size, shard.size, num_layers, ogs,
-                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+                                  learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, coat_exp, main_stream);
             }
         } else {
             // ----------------------------------------------------------------
@@ -2832,7 +2835,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                           model->v_kfactors + layer_meta_offset,
                                           layer_elems, layer_elems, layer_elems, layer_elems, 1, ogs,
                                           learning_rate, beta1, beta2, t, eps, wd, grad_scale,
-                                          seed + (unsigned int)l, main_stream);
+                                          seed + (unsigned int)l, coat_exp, main_stream);
                     } else if (oq == 2) {
                         adamw_update_int8(sd, layer_master_ptr, layer_grad_ptr,
                                           model->m_qstate   + layer_param_offset,
@@ -2843,7 +2846,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                           model->v_kfactors + layer_meta_offset,
                                           layer_elems, layer_elems, layer_elems, layer_elems, 1, ogs,
                                           learning_rate, beta1, beta2, t, eps, wd, grad_scale,
-                                          seed + (unsigned int)l, main_stream);
+                                          seed + (unsigned int)l, coat_exp, main_stream);
                     } else { // INT4
                         adamw_update_int4(sd, layer_master_ptr, layer_grad_ptr,
                                           model->m_qstate   + layer_param_offset / 2,
@@ -2854,7 +2857,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                                           model->v_kfactors + layer_meta_offset,
                                           layer_elems, layer_elems, layer_elems, layer_elems, 1, ogs,
                                           learning_rate, beta1, beta2, t, eps, wd, grad_scale,
-                                          seed + (unsigned int)l, main_stream);
+                                          seed + (unsigned int)l, coat_exp, main_stream);
                     }
                     // Re-quantize from master_weights (FP32) → qvalues/scales.
                     // This is more accurate than quantizing from the stochastic-rounded floatX in sd.
@@ -3257,6 +3260,7 @@ void error_usage() {
     fprintf(stderr, "  --aq_group_size <int> group size for activation quantization (default = 32)\n");
     fprintf(stderr, "  --optim_quant <str>   optimizer state format: fp32|fp8|int8|int4 (default = fp32)\n");
     fprintf(stderr, "  --optim_group_size <int> group size for quantized moments (default = %d)\n", COAT_GROUP_SIZE);
+    fprintf(stderr, "  --coat_expansion <0|1> COAT dynamic range expansion: 1=on (default), 0=plain absmax\n");
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
     fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
@@ -3307,6 +3311,7 @@ int main(int argc, char *argv[]) {
     int ptq_group_size = -1; // -1 = unset; resolved after we know the precision
     const char* optim_quant_name = "fp32";
     int optim_group_size = COAT_GROUP_SIZE;
+    int coat_expansion = 1;
     int aq_enabled = 0;
     const char* aq_type_name = "fp8";
     int aq_group_size = 32;
@@ -3327,6 +3332,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--aq_group_size") == 0) { aq_group_size = atoi(argv[i+1]); continue; }
         if (strcmp(argv[i], "--optim_quant") == 0) { optim_quant_name = argv[i+1]; continue; }
         if (strcmp(argv[i], "--optim_group_size") == 0) { optim_group_size = atoi(argv[i+1]); continue; }
+        if (strcmp(argv[i], "--coat_expansion") == 0) { coat_expansion = atoi(argv[i+1]); continue; }
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
         // read in the args
@@ -3431,6 +3437,7 @@ int main(int argc, char *argv[]) {
     printf0("| aq group_size         | %-50d |\n", aq_enabled ? aq_group_size : 0);
     printf0("| optim_quant           | %-50s |\n", optim_quant_name);
     printf0("| optim_group_size      | %-50d |\n", optim_group_size);
+    printf0("| coat_expansion        | %-50d |\n", coat_expansion);
     printf0("+-----------------------+----------------------------------------------------+\n");
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
@@ -3497,6 +3504,27 @@ int main(int argc, char *argv[]) {
         }
         model.optim_quant      = oq;
         model.optim_group_size = optim_group_size;
+        model.coat_expansion   = coat_expansion;
+    }
+    // Parse aq_type name → AQType
+    {
+        AQType at = AQ_TYPE_NONE;
+        if (aq_enabled) {
+            if      (strcmp(aq_type_name, "fp8")  == 0) at = AQ_TYPE_FP8;
+            else if (strcmp(aq_type_name, "int8") == 0) at = AQ_TYPE_INT8;
+            else if (strcmp(aq_type_name, "int4") == 0) at = AQ_TYPE_INT4;
+            else {
+                fprintf(stderr, "Unknown --aq_type '%s'. Expected fp8|int8|int4.\n", aq_type_name);
+                exit(EXIT_FAILURE);
+            }
+            if (aq_group_size <= 0) {
+                fprintf(stderr, "--aq_group_size must be positive (got %d)\n", aq_group_size);
+                exit(EXIT_FAILURE);
+            }
+        }
+        model.aq_enabled   = aq_enabled;
+        model.aq_type      = at;
+        model.aq_group_size = aq_group_size;
     }
     // Parse aq_type name → AQType
     {

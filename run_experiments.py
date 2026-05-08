@@ -50,6 +50,10 @@ def extract_label(cmd):
     if pgs:
         parts.append(f"ptq-gs={pgs.group(1)}")
 
+    ce = re.search(r'--coat_expansion\s+(\S+)', cmd)
+    if ce and ce.group(1) == "0":
+        parts.append("no-expansion")
+
     if re.search(r'-w\s+0', cmd):
         parts.append("no-master")
 
