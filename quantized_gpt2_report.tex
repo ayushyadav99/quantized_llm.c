@@ -79,10 +79,10 @@ The goal of the project is to move from ordinary mixed-precision training toward
 quantization-aware training. In the implementation, \texttt{PTQ} in function and flag names
 is historically inherited, but the training behavior is closer to weight-only QAT. The
 forward and backward passes repeatedly use dequantized versions of quantized weights,
-gradients are accumulated with respect to those dequantized weights, the optimizer updates a
-high-precision state, and the result is quantized again before the next step. This is the
-standard fake-quantization pattern with an implicit straight-through estimator, implemented
-manually in CUDA.
+gradients are accumulated with respect to those dequantized weights, the optimizer updates
+the stored \texttt{floatX} parameters, and the result is quantized again before the next
+step. This is the standard fake-quantization pattern with an implicit straight-through
+estimator, implemented manually in CUDA.
 
 \section{Individual Contribution}
 
@@ -158,15 +158,34 @@ expanded, scaled, and quantized back to low precision per group.
 
 \section{Method}
 
+Figure~\ref{fig:qat-arch} gives an overview of the full quantized training pipeline. The
+following subsections describe each component in detail.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.82\linewidth]{figures/architecture_after_QAT.png}
+  \caption{GPT-2 QAT architecture overview. Green blocks indicate weight quantization
+  (QAT/PTQ), orange markers indicate activation quantization, and the table at the bottom
+  summarises the COAT-style optimizer-state quantization applied to AdamW moments.}
+  \label{fig:qat-arch}
+\end{figure*}
+
 \subsection{Base Model and Numerical Conventions}
 
 The base model is a GPT-2 decoder-only Transformer with token and positional embeddings,
 repeated pre-norm attention/MLP blocks, a final layer norm, and a weight-tied language-model
-head. The project preserves the original \texttt{llm.c} mixed-precision convention. Forward
-and backward tensors use \texttt{floatX}, which is selected at compile time as
-\texttt{FP32} or \texttt{BF16}; sensitive statistics such as layer-norm means, inverse
-standard deviations, and loss buffers remain \texttt{FP32}; and AdamW math promotes
-gradients to \texttt{FP32}.
+head. Figure~\ref{fig:base-arch} shows the unmodified architecture. The project preserves
+the original \texttt{llm.c} mixed-precision convention. Forward and backward tensors use
+\texttt{floatX}, which is selected at compile time as \texttt{FP32} or \texttt{BF16};
+sensitive statistics such as layer-norm means, inverse standard deviations, and loss buffers
+remain \texttt{FP32}; and AdamW math promotes gradients to \texttt{FP32}.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.52\linewidth]{figures/initial_architecture.png}
+  \caption{Baseline GPT-2 decoder-only architecture before any quantization modifications.}
+  \label{fig:base-arch}
+\end{figure}
 
 The important engineering invariant is that quantized storage is not used directly as GEMM
 input. The code dequantizes a layer slice into \texttt{scratch\_dequant}, then calls the
@@ -209,9 +228,9 @@ weight gradient.
 
 This gives the model a quantized view of its weights during both forward and backward
 computation. Gradients are accumulated with respect to the dequantized weights, and the
-optimizer treats those gradients as gradients for the high-precision master weights. In
-other words, the rounding operation is bypassed in the backward pass, which is the usual STE
-assumption in QAT.
+optimizer uses them to update the \texttt{floatX} weight buffer directly. In other words,
+the rounding operation is bypassed in the backward pass, which is the usual STE assumption
+in QAT.
 
 \subsection{Optimizer State Quantization: Compress the Largest Persistent Training State}
 
@@ -221,29 +240,57 @@ off, AdamW keeps $m$ and $v$ as \texttt{FP32}. If optimizer quantization is on, 
 allocates quantized byte arrays for $m$ and $v$, plus one scale and one $k$ factor per
 group. \texttt{INT4} packs two state values per byte.
 
-The FP8 path is modeled after COAT. For each group, the code estimates the local dynamic
-range, computes an exponent $k$, expands values as
-$\operatorname{sign}(x)|x|^k$, scales them into the target quantizer range, and stores the
-resulting low-precision payload. On the next optimizer step, it dequantizes and unexpands
-the moments before running AdamW.
+All three quantized formats (\texttt{FP8}, \texttt{INT8}, and \texttt{INT4}) are modeled
+after COAT. For each group, the code estimates the local dynamic range, computes an exponent
+$k$, expands values as $\operatorname{sign}(x)|x|^k$, scales them into the target quantizer
+range, and stores the resulting low-precision payload. On the next optimizer step, it
+dequantizes and unexpands the moments before running AdamW.
 
 The update path is numerically conservative. AdamW computes the moment updates, bias
 correction, weight decay term, and parameter update in \texttt{FP32}. Low precision is a
 storage format for optimizer state between steps, not the arithmetic format for AdamW's
-update itself. The system also keeps \texttt{master\_weights} by default, so parameter
-updates retain a high-precision source of truth.
+update itself. Master weights are an optional feature controlled by the \texttt{-w} flag
+and were disabled in the QAT configuration. Without master weights, the re-quantization
+step reads directly from the \texttt{floatX} parameters that AdamW writes, rather than
+from a separate \texttt{FP32} copy.
 
 \subsection{Activation Quantization}
 
-Activation quantization is enabled with \texttt{--aq 1} and configured with \texttt{--aq\_type fp8|int8|int4} and \texttt{--aq\_group\_size}. When enabled, seven intermediate tensors are compressed per Transformer block: the LayerNorm-1 output (\texttt{ln1}), the QKV projection buffer (\texttt{qkvr}), the attention output (\texttt{atty}), the post-attention residual (\texttt{residual2}), the LayerNorm-2 output (\texttt{ln2}), the MLP pre-GELU hidden state (\texttt{fch}), and the MLP post-GELU hidden state (\texttt{fch\_gelu}). Together, these cover the activations that must survive from the forward pass to the backward pass, and compressing them is the primary source of activation memory savings.
+Activation quantization is enabled with \texttt{--aq 1}. The precision format is selected
+with \texttt{--aq\_type} (\texttt{fp8}, \texttt{int8}, or \texttt{int4}) and the group
+dimensions with \texttt{--aq\_group\_size}. When enabled, seven intermediate tensors are
+compressed per Transformer block: the LayerNorm-1 output (\texttt{ln1}), the QKV projection
+buffer (\texttt{qkvr}), the attention output (\texttt{atty}), the post-attention residual
+(\texttt{residual2}), the LayerNorm-2 output (\texttt{ln2}), the MLP pre-GELU hidden state
+(\texttt{fch}), and the MLP post-GELU hidden state (\texttt{fch\_gelu}). Together, these
+cover the activations that must survive from the forward pass to the backward pass, and
+compressing them is the primary source of activation memory savings.
+
 
 \subsubsection{Group Quantization Scheme}
 
-All three formats share the same two-dimensional group structure. Each activation tensor is treated as a matrix of shape $(\text{rows}) \times (\text{cols})$, tiled into non-overlapping blocks of size $g_m \times g_n$ elements (set by \texttt{--aq\_group\_size}). For each group, the kernel first sweeps the block with a parallel reduction to find the absolute maximum $m$, then stores one floating-point scale $s = m / q_{\max}$, where $q_{\max}$ is the representable maximum of the target format. Elements are then mapped to the quantized grid by dividing by $s$ and encoding. On dequantization, the stored integer is decoded and multiplied by $s$.
+All three formats share the same COAT-style row-based group structure. Each activation
+tensor is treated as a matrix of shape $(\text{rows}) \times (\text{cols})$, where each
+row is divided into non-overlapping segments of \texttt{--aq\_group\_size} columns. One
+floating-point scale $s = m / q_{\max}$ is stored per segment, where $m$ is the absolute
+maximum of that segment and $q_{\max}$ is the representable maximum of the target format.
+Elements are mapped to the quantized grid by dividing by $s$ and encoding. On
+dequantization, the stored value is decoded and multiplied by $s$. This $1 \times
+g_n$ grouping aligns with Transformer activation structure, where values within a token
+row share a more coherent dynamic range than arbitrary 2D tiles.
+
 
 \subsubsection{Format Details}
 
-For \textbf{FP8 (E4M3)}, each element is divided by its group scale, clamped to the E4M3 range, and packed into one byte using the same \texttt{ptq\_encode\_fp8\_e4m3} / \texttt{ptq\_decode\_fp8\_e4m3} pair used for weight quantization. For \textbf{INT8}, values are divided by the group scale, rounded, and clamped to $[-127, 127]$ before storage in a \texttt{uint8\_t} array with a zero-point of 128. For \textbf{INT4}, two logical elements share one byte: the first element occupies the high nibble and the second occupies the low nibble, each clamped to $[-7, 7]$ after scaling; this halves the byte cost relative to INT8.
+For \textbf{FP8 (E4M3)}, each element is divided by its group scale, clamped to the E4M3
+range, and packed into one byte using the same \texttt{ptq\_encode\_fp8\_e4m3} /
+\texttt{ptq\_decode\_fp8\_e4m3} pair used for weight quantization. For \textbf{INT8},
+values are divided by the group scale, rounded, and clamped to $[-127, 127]$; the result
+is stored as a signed \texttt{int8\_t} reinterpreted as a \texttt{uint8\_t} byte, and cast
+back to \texttt{int8\_t} on dequantization. No zero-point offset is used. For \textbf{INT4},
+two logical elements share one byte: the first element occupies the low nibble (bits~0--3)
+and the second occupies the high nibble (bits~4--7), each clamped to $[-7, 7]$ after
+scaling; this halves the byte cost relative to INT8.
 
 \subsubsection{Interaction with Gradient Checkpointing}
 
