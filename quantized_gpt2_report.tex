@@ -17,6 +17,16 @@
 \usepackage{xcolor}
 \usepackage{hyperref}
 \usepackage{enumitem}
+\usepackage{float}
+
+% Relax float placement constraints so figures stay near their text
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.05}
+\renewcommand{\floatpagefraction}{0.8}
+\setcounter{topnumber}{9}
+\setcounter{bottomnumber}{9}
+\setcounter{totalnumber}{9}
 
 \hypersetup{
   colorlinks=true,
@@ -161,14 +171,14 @@ expanded, scaled, and quantized back to low precision per group.
 Figure~\ref{fig:qat-arch} gives an overview of the full quantized training pipeline. The
 following subsections describe each component in detail.
 
-\begin{figure*}[t]
+\begin{figure}[H]
   \centering
-  \includegraphics[width=0.82\linewidth]{figures/architecture_after_QAT.png}
+  \includegraphics[width=0.92\linewidth]{figures/architecture_after_QAT.png}
   \caption{GPT-2 QAT architecture overview. Green blocks indicate weight quantization
   (QAT/PTQ), orange markers indicate activation quantization, and the table at the bottom
   summarises the COAT-style optimizer-state quantization applied to AdamW moments.}
   \label{fig:qat-arch}
-\end{figure*}
+\end{figure}
 
 \subsection{Base Model and Numerical Conventions}
 
@@ -180,7 +190,7 @@ the original \texttt{llm.c} mixed-precision convention. Forward and backward ten
 sensitive statistics such as layer-norm means, inverse standard deviations, and loss buffers
 remain \texttt{FP32}; and AdamW math promotes gradients to \texttt{FP32}.
 
-\begin{figure}[h]
+\begin{figure}[H]
   \centering
   \includegraphics[width=0.52\linewidth]{figures/initial_architecture.png}
   \caption{Baseline GPT-2 decoder-only architecture before any quantization modifications.}
@@ -300,6 +310,7 @@ The recompute level (\texttt{--recompute}) affects how many rows are retained fo
 
 In the forward pass, each activation tensor is quantized immediately after it is produced and before the next kernel reads it. The quantized bytes are written into a pre-allocated contiguous buffer indexed by layer, tensor type, and byte offset. When a subsequent kernel needs the activation, a dequantize call expands the stored bytes back to \texttt{floatX} into a shared scratch buffer. In the backward pass, the corresponding dequantize call restores each activation slice before the gradient kernel executes. The full-precision activation buffers for \texttt{ln2} and \texttt{fch\_gelu} are set to zero size in the activation spec when activation quantization is on, since those activations live entirely in the quantized store.
 
+\clearpage
 \section{Experiment Results}
 
 The experiments are organized as a staged argument. Weight quantization first establishes
@@ -310,7 +321,7 @@ and demonstrates the memory reduction.
 
 \subsection{Weight Quantization Is Stable Above INT4}
 
-\begin{figure*}[t]
+\begin{figure*}[htbp]
   \centering
   \begin{subfigure}{0.49\linewidth}
     \centering
@@ -340,7 +351,7 @@ local dynamic range and narrow the loss gap.
 
 \subsection{Optimizer-State Quantization Works as a Memory Lever}
 
-\begin{figure*}[t]
+\begin{figure*}[htbp]
   \centering
   \begin{subfigure}{0.49\linewidth}
     \centering
@@ -372,7 +383,7 @@ moment groups already have relatively narrow ranges, keeping the expansion facto
 
 \subsection{Activation Quantization Is the Failure Mode}
 
-\begin{figure*}[t]
+\begin{figure*}[htbp]
   \centering
   \begin{subfigure}{0.49\linewidth}
     \centering
@@ -402,7 +413,7 @@ remain in the same loss band as the other quantized runs.
 
 \subsection{Memory Reduction}
 
-\begin{figure}[t]
+\begin{figure}[htbp]
   \centering
   \includegraphics[width=0.42\linewidth]{figures/fig7-memory.png}
   \caption{Measured memory breakdown. The combined quantized configuration reduces total
@@ -417,7 +428,7 @@ The optimizer block drops from 0.93 GiB to 0.13 GiB, confirming the central moti
 optimizer-state quantization. Activation memory also falls from 2.42 GiB to 2.12 GiB, and
 weight memory falls from 0.23 GiB to 0.19 GiB.
 
-\begin{table*}[t]
+\begin{table*}[htbp]
   \centering
   \caption{Experimental conclusions.}
   \label{tab:summary}
