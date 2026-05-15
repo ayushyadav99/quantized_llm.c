@@ -18,6 +18,7 @@
 \usepackage{hyperref}
 \usepackage{enumitem}
 \usepackage{float}
+\usepackage[section]{placeins}
 
 % Relax float placement constraints so figures stay near their text
 \renewcommand{\topfraction}{0.9}
@@ -168,10 +169,18 @@ expanded, scaled, and quantized back to low precision per group.
 
 \section{Method}
 
-Figure~\ref{fig:qat-arch} gives an overview of the full quantized training pipeline. The
-following subsections describe each component in detail.
+Figure~\ref{fig:base-arch} shows the baseline GPT-2 decoder-only architecture.
+Figure~\ref{fig:qat-arch} gives an overview of the full quantized training pipeline built on top of it.
+The following subsections describe each component in detail.
 
-\begin{figure}[H]
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.52\linewidth]{figures/initial_architecture.png}
+  \caption{Baseline GPT-2 decoder-only architecture before any quantization modifications.}
+  \label{fig:base-arch}
+\end{figure}
+
+\begin{figure}[htbp]
   \centering
   \includegraphics[width=0.92\linewidth]{figures/architecture_after_QAT.png}
   \caption{GPT-2 QAT architecture overview. Green blocks indicate weight quantization
@@ -184,18 +193,11 @@ following subsections describe each component in detail.
 
 The base model is a GPT-2 decoder-only Transformer with token and positional embeddings,
 repeated pre-norm attention/MLP blocks, a final layer norm, and a weight-tied language-model
-head. Figure~\ref{fig:base-arch} shows the unmodified architecture. The project preserves
-the original \texttt{llm.c} mixed-precision convention. Forward and backward tensors use
-\texttt{floatX}, which is selected at compile time as \texttt{FP32} or \texttt{BF16};
-sensitive statistics such as layer-norm means, inverse standard deviations, and loss buffers
-remain \texttt{FP32}; and AdamW math promotes gradients to \texttt{FP32}.
-
-\begin{figure}[H]
-  \centering
-  \includegraphics[width=0.52\linewidth]{figures/initial_architecture.png}
-  \caption{Baseline GPT-2 decoder-only architecture before any quantization modifications.}
-  \label{fig:base-arch}
-\end{figure}
+head. The project preserves the original \texttt{llm.c} mixed-precision convention.
+Forward and backward tensors use \texttt{floatX}, which is selected at compile time as
+\texttt{FP32} or \texttt{BF16}; sensitive statistics such as layer-norm means, inverse
+standard deviations, and loss buffers remain \texttt{FP32}; and AdamW math promotes
+gradients to \texttt{FP32}.
 
 The important engineering invariant is that quantized storage is not used directly as GEMM
 input. The code dequantizes a layer slice into \texttt{scratch\_dequant}, then calls the
@@ -310,7 +312,7 @@ The recompute level (\texttt{--recompute}) affects how many rows are retained fo
 
 In the forward pass, each activation tensor is quantized immediately after it is produced and before the next kernel reads it. The quantized bytes are written into a pre-allocated contiguous buffer indexed by layer, tensor type, and byte offset. When a subsequent kernel needs the activation, a dequantize call expands the stored bytes back to \texttt{floatX} into a shared scratch buffer. In the backward pass, the corresponding dequantize call restores each activation slice before the gradient kernel executes. The full-precision activation buffers for \texttt{ln2} and \texttt{fch\_gelu} are set to zero size in the activation spec when activation quantization is on, since those activations live entirely in the quantized store.
 
-\clearpage
+\FloatBarrier
 \section{Experiment Results}
 
 The experiments are organized as a staged argument. Weight quantization first establishes
@@ -321,7 +323,7 @@ and demonstrates the memory reduction.
 
 \subsection{Weight Quantization Is Stable Above INT4}
 
-\begin{figure*}[htbp]
+\begin{figure}[htbp]
   \centering
   \begin{subfigure}{0.49\linewidth}
     \centering
@@ -340,7 +342,7 @@ and demonstrates the memory reduction.
   weights. INT4 requires finer group-wise scaling; group size 4 is the strongest tested
   INT4 setting.}
   \label{fig:weights}
-\end{figure*}
+\end{figure}
 
 Figure~\ref{fig:weights} compares the original model with \texttt{FP8}, \texttt{INT8}, and
 \texttt{INT4} stored weights. \texttt{FP8} and \texttt{INT8} follow the original curve
@@ -351,7 +353,7 @@ local dynamic range and narrow the loss gap.
 
 \subsection{Optimizer-State Quantization Works as a Memory Lever}
 
-\begin{figure*}[htbp]
+\begin{figure}[htbp]
   \centering
   \begin{subfigure}{0.49\linewidth}
     \centering
@@ -370,7 +372,7 @@ local dynamic range and narrow the loss gap.
   persistent-state memory lever, and the low-precision moment formats do not immediately
   destabilize training.}
   \label{fig:optimizer}
-\end{figure*}
+\end{figure}
 
 Figure~\ref{fig:optimizer} shows that optimizer-state quantization is the main memory
 contribution. AdamW's $m$ and $v$ buffers are normally \texttt{FP32}, so replacing them with
@@ -383,7 +385,7 @@ moment groups already have relatively narrow ranges, keeping the expansion facto
 
 \subsection{Activation Quantization Is the Failure Mode}
 
-\begin{figure*}[htbp]
+\begin{figure}[htbp]
   \centering
   \begin{subfigure}{0.49\linewidth}
     \centering
@@ -401,7 +403,7 @@ moment groups already have relatively narrow ranges, keeping the expansion facto
   \caption{Activation quantization results. The attention path is sensitive to activation
   quantization, but tensor-aware grouping recovers stable training behavior.}
   \label{fig:activation}
-\end{figure*}
+\end{figure}
 
 Figure~\ref{fig:activation} identifies the primary failure mode. A simple grid-style
 activation quantizer is not sufficient for all tensors. The attention path is especially
@@ -428,7 +430,7 @@ The optimizer block drops from 0.93 GiB to 0.13 GiB, confirming the central moti
 optimizer-state quantization. Activation memory also falls from 2.42 GiB to 2.12 GiB, and
 weight memory falls from 0.23 GiB to 0.19 GiB.
 
-\begin{table*}[htbp]
+\begin{table}[htbp]
   \centering
   \caption{Experimental conclusions.}
   \label{tab:summary}
@@ -443,7 +445,7 @@ weight memory falls from 0.23 GiB to 0.19 GiB.
     Memory & 30\% reduction & 3.81 GiB baseline to 2.67 GiB combined setup \\
     \bottomrule
   \end{tabular}
-\end{table*}
+\end{table}
 
 \section{Conclusion}
 
