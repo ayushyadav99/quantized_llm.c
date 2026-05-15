@@ -3,23 +3,27 @@
 Weight quantization, optimizer-state quantization, and activation quantization for GPT-2
 training built on top of Karpathy's `llm.c`.
 
-## Setup
-
-**Prerequisites:** CUDA toolkit, cuBLAS, Python 3.
+## 1. Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
-python dev/data/tinyshakespeare.py   # download and tokenize dataset
-python dev/data/fineweb.py           # (optional) larger dataset
 ```
 
-Download pretrained weights for weight initialization:
+## 2. Download training data
 
 ```bash
-python dev/download_starter_pack.sh
+python dev/data/tinyshakespeare.py
 ```
 
-## Build
+## 3. Download GPT-2 model weights
+
+```bash
+bash dev/download_starter_pack.sh
+```
+
+This downloads `gpt2_124M.bin`, `gpt2_124M_bf16.bin`, and `gpt2_tokenizer.bin`.
+
+## 4. Build
 
 ```bash
 make train_gpt2cu
@@ -27,7 +31,7 @@ make train_gpt2cu
 
 This produces `./train_gpt2cu`.
 
-## Running Experiments
+## 5. Run experiments
 
 ### Baseline (no quantization)
 
@@ -86,7 +90,7 @@ This produces `./train_gpt2cu`.
                -x 300 -s 100 -v 100
 ```
 
-## Running Multiple Experiments and Plotting
+## 6. Run multiple experiments and plot
 
 Use `run_experiments.py` to run a batch of commands and compare loss curves:
 
@@ -95,7 +99,7 @@ python run_experiments.py
 ```
 
 Paste your `./train_gpt2cu ...` commands one per line, then press Enter on a blank line.
-Results are saved under `logs/` and a comparison plot is generated automatically.
+A comparison plot is saved automatically under `logs/`.
 
 To plot from existing logs:
 
